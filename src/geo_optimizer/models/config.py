@@ -7,6 +7,7 @@ so that core modules, CLI, and tests can import from a single source.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # ─── HTTP ────────────────────────────────────────────────────────────────────
@@ -14,6 +15,40 @@ from pathlib import Path
 USER_AGENT = "GEO-Optimizer/2.0 (https://github.com/auriti-labs/geo-optimizer-skill)"
 
 HEADERS = {"User-Agent": USER_AGENT}
+
+# Process-wide User-Agent override for the generic fetch layer (#528). Resolved
+# once at CLI startup from --user-agent / GEO_USER_AGENT and read by
+# utils/http.py, utils/http_async.py and llms_generator.py via get_headers().
+# Deliberately does NOT affect AI_BOTS / CITATION_BOTS-based checks (e.g. the
+# CDN AI-crawler probe, #225): those send a specific bot identity on purpose,
+# and overriding it would defeat the test.
+_user_agent_override: str | None = None
+
+
+def set_user_agent_override(user_agent: str | None) -> None:
+    """Set (or clear, with None) the process-wide User-Agent override."""
+    global _user_agent_override
+    _user_agent_override = user_agent.strip() if user_agent and user_agent.strip() else None
+
+
+def resolve_user_agent_override(cli_value: str | None) -> str | None:
+    """Resolve a User-Agent override from a CLI flag or the GEO_USER_AGENT env var.
+
+    The CLI flag takes precedence. Returns None if neither is set, meaning the
+    default USER_AGENT applies.
+    """
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    env_value = os.environ.get("GEO_USER_AGENT", "").strip()
+    return env_value or None
+
+
+def get_headers() -> dict:
+    """Return the current fetch headers, honoring any active User-Agent override."""
+    if _user_agent_override:
+        return {"User-Agent": _user_agent_override}
+    return dict(HEADERS)
+
 
 # HTTP response size limit: 10 MB (prevents DoS from huge responses) — fix #91
 MAX_RESPONSE_SIZE: int = 10 * 1024 * 1024
@@ -68,15 +103,21 @@ AI_BOTS = {
     "OAI-SearchBot": "OpenAI (ChatGPT search citations)",
     "ChatGPT-User": "OpenAI (ChatGPT on-demand fetch)",
     # ── Anthropic ───────────────────────────────────────────────────────────
-    "anthropic-ai": "Anthropic (Claude training)",
-    "ClaudeBot": "Anthropic (Claude citations)",
+    # anthropic-ai/claude-web removed (#512): not listed in Anthropic's current
+    # published crawler docs (support.claude.com), which name exactly these three.
+    "ClaudeBot": "Anthropic (Claude training)",
     "Claude-SearchBot": "Anthropic (Claude search citations)",
-    "claude-web": "Anthropic (Claude web crawl)",
+    "Claude-User": "Anthropic (Claude on-demand fetch)",
     # ── Perplexity ──────────────────────────────────────────────────────────
     "PerplexityBot": "Perplexity AI (index builder)",
     "Perplexity-User": "Perplexity (citation fetch on-demand)",
     # ── Google ──────────────────────────────────────────────────────────────
-    "Google-Extended": "Google (Gemini training)",
+    # Googlebot (#512): the same crawler that feeds Search also feeds AI
+    # Overviews — Google's own docs state Google-Extended is a robots.txt
+    # token layered on Googlebot's data, not a separate fetching agent, and
+    # controls only Gemini/Vertex training, not AI Overviews eligibility.
+    "Googlebot": "Google (Search + AI Overviews)",
+    "Google-Extended": "Google (Gemini/Vertex training opt-out — not a crawler)",
     "Google-CloudVertexBot": "Google (Vertex AI)",
     # ── Microsoft ───────────────────────────────────────────────────────────
     "Bingbot": "Microsoft (Bing/Copilot search)",
@@ -111,12 +152,10 @@ AI_BOTS = {
 BOT_TIERS = {
     "training": {
         "GPTBot",
-        "anthropic-ai",
-        "claude-web",
+        "ClaudeBot",
         "Google-Extended",
         "Google-CloudVertexBot",
         "Applebot-Extended",
-        "Applebot",
         "cohere-ai",
         "Bytespider",
         "meta-externalagent",
@@ -127,9 +166,10 @@ BOT_TIERS = {
     },
     "search": {
         "OAI-SearchBot",
-        "ClaudeBot",
         "Claude-SearchBot",
         "PerplexityBot",
+        "Googlebot",
+        "Applebot",
         "Bingbot",
         "DuckAssistBot",
         "YouBot",
@@ -138,14 +178,22 @@ BOT_TIERS = {
     },
     "user": {
         "ChatGPT-User",
+        "Claude-User",
         "Perplexity-User",
         "Meta-ExternalFetcher",
         "facebookexternalhit",
     },
 }
 
-# Critical citation bots (search-tier, directly cite sources in AI responses)
-CITATION_BOTS = {"OAI-SearchBot", "ClaudeBot", "Claude-SearchBot", "PerplexityBot"}
+# Critical citation bots (search-tier bots that actually drive AI citations —
+# #512: matches the "AI search crawlers" set, not the training-only crawlers
+# that happen to share a vendor. ClaudeBot is training-only per Anthropic's
+# current docs, so it is excluded here even though it is Anthropic's bot).
+CITATION_BOTS = {"OAI-SearchBot", "Claude-SearchBot", "PerplexityBot", "Googlebot", "Applebot"}
+
+# Human-readable bot labels for user-facing recommendation messages
+ROBOTS_KEY_BOTS_DISPLAY: str = "GPTBot, ClaudeBot, PerplexityBot"
+CITATION_BOTS_DISPLAY: str = "OAI-SearchBot, Claude-SearchBot, PerplexityBot, Googlebot, Applebot"
 
 # ─── Brand normalization ──────────────────────────────────────────────────────
 
@@ -301,6 +349,47 @@ SCHEMA_TEMPLATES = {
         "@context": "https://schema.org",
         "@type": "BreadcrumbList",
         "itemListElement": [{"@type": "ListItem", "position": 1, "name": "Home", "item": "{{url}}"}],
+    },
+    # HowTo, Review and Product close the detect->generate gap: audit_schema.py already
+    # scores has_howto/has_product, and Review/AggregateRating is one of the more
+    # citation-relevant types per GEO research, but `geo schema --type` had no template
+    # for any of the three — a user told "you're missing HowTo schema" had no way to ask
+    # the tool that told them so to generate it.
+    "howto": {
+        "@context": "https://schema.org",
+        "@type": "HowTo",
+        "name": "{{title}}",
+        "description": "{{description}}",
+        "image": "{{image_url}}",
+        "totalTime": "{{total_time}}",
+        "step": [
+            {"@type": "HowToStep", "name": "{{step_1_name}}", "text": "{{step_1_text}}"},
+        ],
+    },
+    "review": {
+        "@context": "https://schema.org",
+        "@type": "Review",
+        "itemReviewed": {"@type": "Thing", "name": "{{name}}"},
+        # ratingValue/bestRating as strings: schema.org accepts Number or Text, and a
+        # template placeholder is text until the user fills it in — matches how every
+        # other numeric-looking field in this file's templates is handled.
+        "reviewRating": {"@type": "Rating", "ratingValue": "{{rating_value}}", "bestRating": "5"},
+        "author": {"@type": "Person", "name": "{{author}}"},
+        "reviewBody": "{{review_body}}",
+    },
+    "product": {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": "{{name}}",
+        "description": "{{description}}",
+        "image": "{{image_url}}",
+        "brand": {"@type": "Brand", "name": "{{author}}"},
+        "offers": {
+            "@type": "Offer",
+            "price": "{{price}}",
+            "priceCurrency": "USD",
+            "availability": "https://schema.org/InStock",
+        },
     },
 }
 
@@ -462,13 +551,48 @@ SCORING = {
 # Separate from the SCORING dict because it is an alternative (not additive) to robots_citation_ok (fix #332)
 ROBOTS_PARTIAL_SCORE = 10
 
+# Max points per scoring category — must stay in sync with the SCORING weights
+# above. Used to rank recommendations by recoverable points (gap #5).
+CATEGORY_MAX = {
+    "robots": 18,
+    "llms": 18,
+    "schema": 16,
+    "meta": 14,
+    "content": 12,
+    "brand_entity": 10,
+    "signals": 6,
+    "ai_discovery": 6,
+}
+
 # Schema richness thresholds — graduated scoring (#394)
 SCHEMA_RICHNESS_HIGH = 5  # avg >= 5 attrs → full points (3pt)
 SCHEMA_RICHNESS_MED = 4  # avg >= 4 attrs → 2pt
 SCHEMA_RICHNESS_LOW = 3  # avg >= 3 attrs → 1pt
 
+# JSON-LD safety caps (fix #182, #191)
+SCHEMA_JSONLD_MAX_BYTES: int = 512 * 1024  # skip scripts larger than 512 KiB
+SCHEMA_RAW_SCHEMAS_CAP: int = 50  # max raw schemas stored per page
+
 # Minimum word threshold for content_word_count (300 words = substantial content)
 CONTENT_MIN_WORDS = 300
+
+# Negative-signals thresholds
+BOILERPLATE_RATIO_THRESHOLD: float = 0.6  # page flagged as boilerplate-heavy above this ratio
+MIXED_SIGNALS_WORD_THRESHOLD: int = 1000  # H1 promises depth but body is below this word count
+
+# Negative-signals score penalties (gap #1 — applied in scoring.py)
+NEGATIVE_PENALTY_HIGH: int = 5  # severity == "high" (4+ signals): -5pt
+NEGATIVE_PENALTY_MED: int = 3  # severity == "medium" (2-3 signals): -3pt
+NEGATIVE_PENALTY_LOW: int = 1  # severity == "low" (1 signal): -1pt
+
+# X-Robots-Tag penalty (gap #2 — page marked noindex via HTTP header)
+XROBOTS_NOINDEX_PENALTY: int = 5
+
+# JS rendering thresholds — used in audit_js to detect SPA / JS-only pages
+JS_EMPTY_ROOT_CHARS: int = 50  # SPA root element considered empty below this char count
+JS_SPA_WORDS: int = 100  # body word count + 0 headings → likely SPA
+JS_EMPTY_ROOT_WORDS: int = 200  # empty root + low word count → JS-dependent
+JS_CRITICAL_WORDS: int = 50  # critically low content threshold
 
 # Content freshness thresholds in days (#401)
 # AutoGEO ICLR 2026: tech content < 3 months strongly preferred by AI search engines
@@ -548,6 +672,7 @@ KEYWORD_STUFFING_THRESHOLD = 0.025
 # URL patterns for "about" pages (fix #391)
 ABOUT_LINK_PATTERNS = [
     "/about",
+    "/manifesto",
     "/chi-siamo",
     "/team",
     "/company",
@@ -568,6 +693,8 @@ TRUST_STACK_GRADE_BANDS = [
     (6, "D", "low"),
     (0, "F", "low"),
 ]
+# 5 layers (technical, identity, social, academic, consistency), 5 points max each (#perception)
+TRUST_STACK_MAX_SCORE = 25
 
 # Authoritative source domains for Academic Trust
 ACADEMIC_AUTHORITY_DOMAINS = [

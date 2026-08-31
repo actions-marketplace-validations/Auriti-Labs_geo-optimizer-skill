@@ -16,14 +16,16 @@ import json
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from geo_optimizer.cli.scoring_helpers import (
+    ai_discovery_score,
     brand_entity_score,
     content_score,
     llms_score,
     meta_score,
     robots_score,
     schema_score,
+    signals_score,
 )
-from geo_optimizer.models.config import SCORING
+from geo_optimizer.models.config import CITATION_BOTS_DISPLAY, SCORING
 from geo_optimizer.models.results import AuditResult
 
 # Per-category max scores computed dynamically from SCORING (avoids hardcoding — v4.3)
@@ -62,7 +64,14 @@ _MAX_BRAND_ENTITY = (
     + SCORING["brand_kg_readiness"]
     + SCORING["brand_geo_identity"]
     + SCORING["brand_topic_authority"]
-    + 2  # about_link (1pt) + contact_info (1pt) — scored inline in scoring.py
+    + SCORING["brand_about_contact"]  # gap #9: was hardcoded +2, now uses SCORING for consistency
+)
+_MAX_SIGNALS = SCORING["signals_lang"] + SCORING["signals_rss"] + SCORING["signals_freshness"]
+_MAX_AI_DISCOVERY = (
+    SCORING["ai_discovery_well_known"]
+    + SCORING["ai_discovery_summary"]
+    + SCORING["ai_discovery_faq"]
+    + SCORING["ai_discovery_service"]
 )
 
 # ─── SARIF ────────────────────────────────────────────────────────────────────
@@ -79,6 +88,43 @@ def format_audit_sarif(result: AuditResult) -> str:
     rules = []
     results = []
 
+    if result.error:
+        rules.append(
+            {
+                "id": "geo/audit-error",
+                "name": "Audit Failed",
+                "shortDescription": {"text": "The site could not be reached"},
+            }
+        )
+        results.append(
+            {
+                "ruleId": "geo/audit-error",
+                "level": "error",
+                "message": {"text": f"GEO audit failed for {result.url}: {result.error}"},
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": result.url}}}],
+            }
+        )
+        return json.dumps(
+            {
+                "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {
+                            "driver": {
+                                "name": "GEO Optimizer",
+                                "informationUri": "https://github.com/auriti-labs/geo-optimizer-skill",
+                                "version": _get_version(),
+                                "rules": rules,
+                            }
+                        },
+                        "results": results,
+                    }
+                ],
+            },
+            indent=2,
+        )
+
     # Map each check category to SARIF rules and results
     checks = [
         ("geo/robots-txt", "robots.txt AI Bot Access", _robots_findings(result)),
@@ -86,6 +132,8 @@ def format_audit_sarif(result: AuditResult) -> str:
         ("geo/schema-jsonld", "JSON-LD Schema Markup", _schema_findings(result)),
         ("geo/meta-tags", "SEO Meta Tags", _meta_findings(result)),
         ("geo/content-quality", "Content Quality", _content_findings(result)),
+        ("geo/signals", "Technical Signals", _signals_findings(result)),
+        ("geo/ai-discovery", "AI Discovery Endpoints", _ai_discovery_findings(result)),
     ]
 
     for rule_id, rule_name, findings in checks:
@@ -185,7 +233,7 @@ def _robots_findings(result: AuditResult) -> list[dict]:
         findings.append(
             {
                 "level": "error",
-                "message": "Critical citation bots (OAI-SearchBot, ClaudeBot, PerplexityBot) not properly configured",
+                "message": f"Critical citation bots ({CITATION_BOTS_DISPLAY}) not properly configured",
             }
         )
     return findings
@@ -247,6 +295,54 @@ def _content_findings(result: AuditResult) -> list[dict]:
     return findings
 
 
+def _signals_findings(result: AuditResult) -> list[dict]:
+    findings: list[dict] = []
+    if not result.signals:
+        return findings
+    if not result.signals.has_lang:
+        findings.append(
+            {
+                "level": "warning",
+                "message": 'Add lang attribute to <html> (e.g., lang="en") for AI language detection (3pt)',
+            }
+        )
+    if not result.signals.has_rss:
+        findings.append(
+            {"level": "note", "message": "Add RSS/Atom feed linked in <head> for AI content discovery (2pt)"}
+        )
+    if not result.signals.has_freshness:
+        findings.append(
+            {"level": "note", "message": "Add lastmod/dateModified signal for content freshness detection (1pt)"}
+        )
+    return findings
+
+
+def _ai_discovery_findings(result: AuditResult) -> list[dict]:
+    findings: list[dict] = []
+    if not result.ai_discovery:
+        return findings
+    if not result.ai_discovery.has_well_known_ai:
+        findings.append(
+            {"level": "warning", "message": "Create /.well-known/ai.txt to define AI crawler permissions (2pt)"}
+        )
+    if not result.ai_discovery.has_summary or not result.ai_discovery.summary_valid:
+        findings.append(
+            {
+                "level": "warning",
+                "message": "Create /ai/summary.json with site name and description for AI engines (2pt)",
+            }
+        )
+    if not result.ai_discovery.has_faq:
+        findings.append(
+            {"level": "note", "message": "Create /ai/faq.json with structured FAQ for AI search visibility (1pt)"}
+        )
+    if not result.ai_discovery.has_service:
+        findings.append(
+            {"level": "note", "message": "Create /ai/service.json to describe service capabilities for AI (1pt)"}
+        )
+    return findings
+
+
 # ─── JUnit XML ────────────────────────────────────────────────────────────────
 
 
@@ -261,6 +357,23 @@ def format_audit_junit(result: AuditResult) -> str:
     # Fix #430: initial value overwritten at line 316 with actual count
     testsuites.set("tests", "0")
 
+    if result.error:
+        testsuites.set("tests", "1")
+        testsuites.set("failures", "0")
+        testsuites.set("errors", "1")
+        testsuite = SubElement(testsuites, "testsuite")
+        testsuite.set("name", "Audit")
+        testsuite.set("tests", "1")
+        testsuite.set("failures", "0")
+        testsuite.set("errors", "1")
+        testcase = SubElement(testsuite, "testcase")
+        testcase.set("name", "audit_reachable")
+        testcase.set("classname", "GEO.Audit")
+        error_el = SubElement(testcase, "error")
+        error_el.set("message", f"GEO audit failed for {result.url}: {result.error}")
+        error_el.set("type", "AuditUnreachable")
+        return '<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(testsuites, encoding="unicode")
+
     categories = [
         ("robots_txt", "Robots.txt AI Bot Access", robots_score(result), _MAX_ROBOTS, _robots_findings(result)),
         ("llms_txt", "llms.txt AI Index File", llms_score(result), _MAX_LLMS, _llms_findings(result)),
@@ -268,6 +381,14 @@ def format_audit_junit(result: AuditResult) -> str:
         ("meta_tags", "SEO Meta Tags", meta_score(result), _MAX_META, _meta_findings(result)),
         ("content_quality", "Content Quality", content_score(result), _MAX_CONTENT, _content_findings(result)),
         ("brand_entity", "Brand & Entity Signals", brand_entity_score(result), _MAX_BRAND_ENTITY, []),
+        ("signals", "Technical Signals", signals_score(result), _MAX_SIGNALS, _signals_findings(result)),
+        (
+            "ai_discovery",
+            "AI Discovery Endpoints",
+            ai_discovery_score(result),
+            _MAX_AI_DISCOVERY,
+            _ai_discovery_findings(result),
+        ),
     ]
 
     total_failures = 0

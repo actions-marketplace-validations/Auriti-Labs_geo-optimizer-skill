@@ -1,95 +1,92 @@
 from __future__ import annotations
 
-import json
 import logging
+from typing import TYPE_CHECKING
 
-from geo_optimizer.models.config import ARTICLE_TYPES, SCHEMA_RICHNESS_HIGH, SCHEMA_RICHNESS_LOW, SCHEMA_RICHNESS_MED
+from geo_optimizer.models.config import (
+    ARTICLE_TYPES,
+    SCHEMA_ORG_REQUIRED,
+    SCHEMA_RAW_SCHEMAS_CAP,
+    SCHEMA_RICHNESS_HIGH,
+    SCHEMA_RICHNESS_LOW,
+    SCHEMA_RICHNESS_MED,
+)
 from geo_optimizer.models.results import SchemaResult
+from geo_optimizer.utils.jsonld import iter_jsonld_objects
+
+if TYPE_CHECKING:
+    from bs4 import BeautifulSoup
+
+_logger = logging.getLogger(__name__)
 
 
-def audit_schema(soup, url: str) -> SchemaResult:
+def audit_schema(soup: BeautifulSoup | None, url: str) -> SchemaResult:
     """Check JSON-LD schema on homepage. Returns SchemaResult."""
     result = SchemaResult()
+    if soup is None:
+        return result
 
     scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
     if not scripts:
         return result
 
-    for script in scripts:
+    def _count_parse_error(exc: Exception) -> None:
+        _logger.debug("Invalid JSON schema ignored: %s", exc)
+        result.json_parse_errors += 1  # fix #399: track errors for recommendations
+
+    for schema in iter_jsonld_objects(soup, on_parse_error=_count_parse_error):
         try:
-            # script.string can be None if the tag has multiple child nodes
-            raw = script.string
-            if not raw:
-                raw = script.get_text()
-            if not raw or not raw.strip():
-                continue
-            # Size limit: prevent DoS from oversized JSON-LD (fix #182)
-            if len(raw) > 512 * 1024:
-                logging.debug("JSON-LD too large (%d bytes), skipping", len(raw))
-                continue
-            data = json.loads(raw)
-            # Fix: support @graph format (used by Yoast SEO, RankMath, etc.)
-            if isinstance(data, dict) and "@graph" in data:
-                schemas = data["@graph"] if isinstance(data["@graph"], list) else [data["@graph"]]
-            elif isinstance(data, list):
-                schemas = data
+            schema_type = schema.get("@type", "unknown")
+            if isinstance(schema_type, list):
+                schema_types = schema_type
             else:
-                schemas = [data]
+                schema_types = [schema_type]
 
-            for schema in schemas:
-                # Fix: skip non-dict items in JSON-LD arrays (ad trackers, malformed scripts)
-                if not isinstance(schema, dict):
-                    continue
+            # Add the raw schema (cap at 50 to prevent memory bloat — fix #191)
+            if len(result.raw_schemas) < SCHEMA_RAW_SCHEMAS_CAP:
+                result.raw_schemas.append(schema)
 
-                schema_type = schema.get("@type", "unknown")
-                if isinstance(schema_type, list):
-                    schema_types = schema_type
-                else:
-                    schema_types = [schema_type]
+            for t in schema_types:
+                result.found_types.append(t)
 
-                # Add the raw schema (cap at 50 to prevent memory bloat — fix #191)
-                if len(result.raw_schemas) < 50:
-                    result.raw_schemas.append(schema)
+                if t == "WebSite":
+                    result.has_website = True
+                elif t == "WebApplication":
+                    result.has_webapp = True
+                elif t == "FAQPage":
+                    result.has_faq = True
+                elif t in ARTICLE_TYPES:
+                    result.has_article = True
+                elif t == "Organization":
+                    result.has_organization = True
+                elif t == "HowTo":
+                    result.has_howto = True
+                elif t in ("Person",):
+                    result.has_person = True
+                elif t == "Product":
+                    result.has_product = True
 
-                for t in schema_types:
-                    result.found_types.append(t)
+                # Any valid schema type (not unknown) counts
+                if t != "unknown":
+                    result.any_schema_found = True
 
-                    if t == "WebSite":
-                        result.has_website = True
-                    elif t == "WebApplication":
-                        result.has_webapp = True
-                    elif t == "FAQPage":
-                        result.has_faq = True
-                    elif t in ARTICLE_TYPES:
-                        result.has_article = True
-                    elif t == "Organization":
-                        result.has_organization = True
-                    elif t == "HowTo":
-                        result.has_howto = True
-                    elif t in ("Person",):
-                        result.has_person = True
-                    elif t == "Product":
-                        result.has_product = True
+            # Check the sameAs property
+            same_as = schema.get("sameAs", [])
+            if isinstance(same_as, str):
+                same_as = [same_as]
+            if same_as:
+                result.has_sameas = True
+                result.sameas_urls.extend(same_as[:10])  # cap at 10
 
-                    # Any valid schema type (not unknown) counts
-                    if t != "unknown":
-                        result.any_schema_found = True
+            # Check dateModified
+            if schema.get("dateModified"):
+                result.has_date_modified = True
 
-                # Check the sameAs property
-                same_as = schema.get("sameAs", [])
-                if isinstance(same_as, str):
-                    same_as = [same_as]
-                if same_as:
-                    result.has_sameas = True
-                    result.sameas_urls.extend(same_as[:10])  # cap at 10
-
-                # Check dateModified
-                if schema.get("dateModified"):
-                    result.has_date_modified = True
-
-        except (json.JSONDecodeError, AttributeError, TypeError) as exc:
-            # Parsing failed: log at debug (not critical, third-party scripts) — fix #81
-            logging.debug("Invalid JSON schema ignored: %s", exc)
+        except (AttributeError, TypeError) as exc:
+            # Defensive: a malformed-but-parseable JSON-LD object shaped unexpectedly
+            # (fix #81). Actual JSON parse failures are counted by iter_jsonld_objects's
+            # on_parse_error above, before a schema object like this one exists.
+            _logger.debug("Invalid JSON schema ignored: %s", exc)
             result.json_parse_errors += 1  # fix #399: track errors for recommendations
 
     # Schema richness (Growth Marshal Feb 2026): count attributes per schema
@@ -114,6 +111,18 @@ def audit_schema(soup, url: str) -> SchemaResult:
             result.schema_richness_score = 1
         else:
             result.schema_richness_score = 0
+
+    # Schema completeness (gap #3): check required fields per SCHEMA_ORG_REQUIRED
+    for schema_obj in result.raw_schemas:
+        schema_type_raw = schema_obj.get("@type", "unknown")
+        types_to_check = schema_type_raw if isinstance(schema_type_raw, list) else [schema_type_raw]
+        for t in types_to_check:
+            t_lower = t.lower()
+            if t_lower in SCHEMA_ORG_REQUIRED:
+                missing = [f for f in SCHEMA_ORG_REQUIRED[t_lower] if f not in schema_obj]
+                if missing and t not in result.incomplete_schema_types:
+                    result.schema_missing_fields[t] = missing
+                    result.incomplete_schema_types.append(t)
 
     # #232: E-commerce GEO Profile — analyze Product schema richness
     if result.has_product:

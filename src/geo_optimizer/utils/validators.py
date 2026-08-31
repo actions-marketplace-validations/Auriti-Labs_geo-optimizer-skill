@@ -109,12 +109,12 @@ def _check_ip_blocked(ip_str: str) -> tuple[bool, str | None]:
         if ip_obj in network:
             # Fix M-3: generic message to user, detailed log at DEBUG only
             logger.debug("Blocked IP %s in network %s", ip_str, network)
-            return True, "URL points to a non-public address."
+            return True, "URL points to a non-public address. Please use a public URL (e.g., https://example.com)."
 
     # Fallback: catch private networks not in the explicit blocklist
     if _is_ip_blocked(ip_obj):
         logger.debug("Blocked IP %s (private/reserved per stdlib)", ip_str)
-        return True, "URL points to a non-public address."
+        return True, "URL points to a non-public address. Please use a public URL (e.g., https://example.com)."
 
     return False, None
 
@@ -159,6 +159,32 @@ def resolve_and_validate_url(url: str) -> tuple[bool, str | None, list[str]]:
         ip_validi.append(ip_str)
 
     return True, None, ip_validi
+
+
+def normalize_url_scheme(url: str) -> str:
+    """Ensure a URL has an http(s) scheme, adding ``https://`` if it has none.
+
+    Case-insensitive on purpose: 15 call sites across this codebase used to
+    each inline ``if not url.startswith(("http://", "https://"))``, a
+    case-sensitive check. A URL a user typed or pasted with an uppercase
+    scheme — ``HTTP://example.com`` — fails that check despite already
+    having a scheme, so it gets a second one prepended:
+    ``https://HTTP://example.com``. `urlparse` then reads ``HTTP:`` as the
+    netloc and the real host disappears into the path, and the URL fails
+    DNS resolution with an error that blames the domain instead of the
+    parsing. Confirmed live: ``geo audit --url HTTP://geoready.dev`` failed
+    with "DNS resolution failed" against a domain that resolves fine.
+
+    Args:
+        url: Raw URL or bare hostname (e.g. "example.com").
+
+    Returns:
+        The URL unchanged if it already has any http(s) scheme in any case,
+        otherwise the URL prefixed with ``https://``.
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        return f"https://{url}"
+    return url
 
 
 def validate_public_url(url: str) -> tuple[bool, str | None]:

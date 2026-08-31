@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The GEO Optimizer Manifesto — Why AI Search Visibility Should Be Open</title>
 <meta name="description" content="Why AI search visibility should be auditable, open, and accessible to every website on the internet. The GEO Optimizer Manifesto.">
-<link rel="canonical" href="https://geo-optimizer-web.onrender.com/manifesto">
+<link rel="canonical" href="https://geoready.dev/manifesto">
 <meta property="og:title" content="The GEO Optimizer Manifesto">
 <meta property="og:description" content="Why AI search visibility should be auditable, open, and accessible to every website on the internet.">
 <meta property="og:type" content="article">
-<meta property="og:url" content="https://geo-optimizer-web.onrender.com/manifesto">
+<meta property="og:url" content="https://geoready.dev/manifesto">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -169,16 +169,51 @@ footer .credit{font-size:.72rem;color:var(--text-muted)}
   section h2{font-size:1.3rem}
   .bottom-line{padding:1.5rem 1rem}
 }
+
+/* ─── Floating cookie settings button ─── */
+.cookie-float-btn {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 1.5rem;
+  z-index: 9990;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(13, 17, 23, 0.9);
+  border: 1px solid #1b2332;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  text-decoration: none;
+  color: #64748b;
+  transition: color 0.2s, border-color 0.2s;
+}
+.cookie-float-btn:hover { color: #e2e8f0; border-color: #3b82f6; }
+.cookie-float-btn svg { width: 20px; height: 20px; }
 </style>
 
 <!-- Schema JSON-LD: WebSite (root entity) -->
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"WebSite","name":"GEO Optimizer","url":"https://geo-optimizer-web.onrender.com","description":"Open-source toolkit to audit and optimize websites for AI search engine visibility.","author":{"@type":"Organization","name":"Auriti Labs","url":"https://github.com/Auriti-Labs","sameAs":["https://github.com/Auriti-Labs","https://pypi.org/project/geo-optimizer-skill/","https://www.linkedin.com/in/juanauriti/","https://www.linkedin.com/company/auriti-labs","https://www.crunchbase.com/organization/auriti-labs"],"contactPoint":{"@type":"ContactPoint","contactType":"technical support","email":"juancamilo.auriti@gmail.com","url":"https://github.com/Auriti-Labs/geo-optimizer-skill/issues"},"address":{"@type":"PostalAddress","addressCountry":"IT"}},"potentialAction":{"@type":"SearchAction","target":"https://geo-optimizer-web.onrender.com/?url={url}","query-input":"required name=url"}}
+{"@context":"https://schema.org","@type":"WebSite","name":"GEO Optimizer","url":"https://geoready.dev","description":"Open-source toolkit to audit and optimize websites for AI search engine visibility.","author":{"@type":"Organization","name":"Auriti Labs","url":"https://github.com/Auriti-Labs","sameAs":["https://github.com/Auriti-Labs","https://pypi.org/project/geo-optimizer-skill/","https://www.linkedin.com/in/juanauriti/","https://www.linkedin.com/company/auriti-labs","https://www.crunchbase.com/organization/auriti-labs"],"contactPoint":{"@type":"ContactPoint","contactType":"technical support","email":"juancamilo.auriti@gmail.com","url":"https://github.com/Auriti-Labs/geo-optimizer-skill/issues"},"address":{"@type":"PostalAddress","addressCountry":"IT"}},"potentialAction":{"@type":"SearchAction","target":"https://geoready.dev/?url={url}","query-input":"required name=url"}}
 </script>
 <!-- Schema JSON-LD: WebPage -->
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"WebPage","name":"The GEO Optimizer Manifesto","url":"https://geo-optimizer-web.onrender.com/manifesto","description":"Why AI search visibility should be auditable, open, and accessible to every website on the internet.","isPartOf":{"@type":"WebSite","name":"GEO Optimizer","url":"https://geo-optimizer-web.onrender.com"},"author":{"@type":"Organization","name":"Auriti Labs","url":"https://github.com/Auriti-Labs"},"datePublished":"2026-03-28","dateModified":"2026-03-30","inLanguage":"en"}
+{"@context":"https://schema.org","@type":"WebPage","name":"The GEO Optimizer Manifesto","url":"https://geoready.dev/manifesto","description":"Why AI search visibility should be auditable, open, and accessible to every website on the internet.","isPartOf":{"@type":"WebSite","name":"GEO Optimizer","url":"https://geoready.dev"},"author":{"@type":"Organization","name":"Auriti Labs","url":"https://github.com/Auriti-Labs"},"datePublished":"2026-03-28","dateModified":"2026-03-30","inLanguage":"en"}
 </script>
+<!-- SEO: Open Graph / Social Media -->
+<meta property="og:type" content="article">
+<meta property="og:title" content="The GEO Optimizer Manifesto — Why AI Search Visibility Should Be Open">
+<meta property="og:description" content="Why AI search visibility should be auditable, open, and accessible to every website on the internet.">
+<meta property="og:url" content="https://geoready.dev/manifesto">
+<meta property="og:image" content="https://geoready.dev/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:site_name" content="GEO Optimizer">
+<meta property="og:locale" content="en_US">
+
 <!-- Schema JSON-LD: FAQPage -->
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is GEO Optimizer?","acceptedAnswer":{"@type":"Answer","text":"GEO Optimizer is an open-source toolkit that audits websites for AI search engine visibility. It scores sites 0-100 based on 8 categories and 47 research-backed methods, covering robots.txt, llms.txt, Schema JSON-LD, meta tags, content quality, technical signals, AI discovery, and brand entity signals."}},{"@type":"Question","name":"Why does AI search visibility matter?","acceptedAnswer":{"@type":"Answer","text":"AI search engines like ChatGPT, Perplexity, and Claude synthesize answers from cited sources. Sites not optimized for AI visibility are invisible in these answers. Princeton KDD 2024 research shows source citations increase AI visibility by 27-115%, statistics by 33%, and authoritative tone by 29%."}},{"@type":"Question","name":"Is GEO Optimizer free and open source?","acceptedAnswer":{"@type":"Answer","text":"Yes. GEO Optimizer is MIT-licensed open source software. Install with: pip install geo-optimizer-skill. The scoring rubric, algorithms, and all weights are publicly documented."}},{"@type":"Question","name":"What websites does GEO Optimizer work with?","acceptedAnswer":{"@type":"Answer","text":"GEO Optimizer works with any publicly accessible URL regardless of the underlying technology. It audits the HTTP response that AI engines see, so it works with static sites, WordPress, Next.js, custom backends, headless architectures, and anything else that responds to HTTP requests."}}]}
@@ -504,5 +539,18 @@ document.addEventListener('click',function(){
   });
 });
 </script>
+
+<!-- Floating cookie settings button: link alle impostazioni cookie -->
+<a href="/privacy#cookies" class="cookie-float-btn" title="Cookie settings" aria-label="Cookie settings">
+  <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5"/>
+    <circle cx="8" cy="9" r="1.5" fill="currentColor"/>
+    <circle cx="15" cy="8" r="1" fill="currentColor"/>
+    <circle cx="14" cy="14" r="1.5" fill="currentColor"/>
+    <circle cx="9" cy="15" r="1" fill="currentColor"/>
+    <circle cx="17" cy="13" r="1" fill="currentColor"/>
+  </svg>
+</a>
+
 </body>
 </html>

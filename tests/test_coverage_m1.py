@@ -553,6 +553,47 @@ class TestFileCache:
         cache_custom = FileCache(ttl=7200)
         assert cache_custom.ttl == 7200
 
+    def test_eviction_non_avviene_se_sotto_il_limite(self):
+        """_evict_if_needed non rimuove file se la cache è sotto il limite."""
+        from geo_optimizer.utils.cache import FileCache
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = FileCache(cache_dir=Path(tmpdir))
+            cache.put("https://example.com/a", 200, "contenuto breve", {})
+            cache.put("https://example.com/b", 200, "altro contenuto", {})
+
+            files_before = list(Path(tmpdir).glob("*.json"))
+            cache._evict_if_needed()
+            files_after = list(Path(tmpdir).glob("*.json"))
+
+            assert len(files_after) == len(files_before)
+
+    def test_clear_directory_inesistente_ritorna_zero(self):
+        """clear() ritorna 0 senza errori se la directory non esiste."""
+        from geo_optimizer.utils.cache import FileCache
+
+        cache = FileCache(cache_dir=Path("/tmp/geo_cache_inesistente_xyz_12345"))
+        result = cache.clear()
+        assert result == 0
+
+    def test_eviction_rimuove_file_quando_supera_limite(self):
+        """_evict_if_needed rimuove i file più vecchi quando il limite è superato."""
+        from unittest.mock import patch
+
+        from geo_optimizer.utils.cache import FileCache
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = FileCache(cache_dir=Path(tmpdir))
+            cache.put("https://example.com/page1", 200, "x" * 100, {})
+            cache.put("https://example.com/page2", 200, "x" * 100, {})
+            cache.put("https://example.com/page3", 200, "x" * 100, {})
+
+            with patch("geo_optimizer.utils.cache.MAX_CACHE_SIZE_BYTES", 1):
+                cache._evict_if_needed()
+
+            files_after = list(Path(tmpdir).glob("*.json"))
+            assert len(files_after) == 0
+
 
 # ============================================================================
 # 3 — cli/rich_formatter.py
@@ -625,8 +666,8 @@ class TestRichFormatter:
         result = _crea_audit_result_vuoto()
         output = format_audit_rich(result)
 
-        # v2: testo in italiano "File non trovato"
-        assert "non trovato" in output
+        # v2: English-only output ("File not found")
+        assert "not found" in output
 
     @pytest.mark.skipif(
         not __import__("importlib").util.find_spec("rich"),
@@ -639,8 +680,8 @@ class TestRichFormatter:
         result = _crea_audit_result_vuoto()
         output = format_audit_rich(result)
 
-        # v2: testo in italiano "File non trovato"
-        assert "non trovato" in output
+        # v2: English-only output ("File not found")
+        assert "not found" in output
 
     @pytest.mark.skipif(
         not __import__("importlib").util.find_spec("rich"),
@@ -674,14 +715,17 @@ class TestRichFormatter:
         reason="rich non installato",
     )
     def test_format_audit_rich_schema_nessuno(self):
-        """Senza schema, l'output mostra 'Nessuno schema'."""
+        """Senza schema, l'output segnala l'assenza in inglese."""
         from geo_optimizer.cli.rich_formatter import format_audit_rich
 
         result = _crea_audit_result_vuoto()
         output = format_audit_rich(result)
 
-        # v2: testo in italiano "Nessuno schema trovato"
-        assert "Nessuno schema" in output
+        # Era "Nessuno schema trovato": una delle stringhe italiane hardcoded
+        # nel report inglese, segnalate nella issue #509. Il test asseriva il bug
+        # come comportamento atteso, quindi è stato aggiornato insieme al fix.
+        assert "No schema found" in output
+        assert "Nessuno schema" not in output
 
     def test_score_color_returns_color(self):
         """_score_color() ritorna un colore hex basato sulla percentuale."""

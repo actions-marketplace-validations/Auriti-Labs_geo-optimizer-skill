@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 
 from geo_optimizer.models.results import FactualAccuracyResult
 from geo_optimizer.utils.http import fetch_url
+from geo_optimizer.utils.validators import normalize_url_scheme
 
 _NUMERIC_CLAIM_RE = re.compile(
     r"\b\d+(?:[.,]\d+)?%"
@@ -97,12 +98,12 @@ _DEFAULT_MAX_SOURCE_CHECKS = 8
 
 def run_factual_accuracy_audit(url: str, max_source_checks: int = _DEFAULT_MAX_SOURCE_CHECKS) -> FactualAccuracyResult:
     """Scarica una pagina e restituisce un audit fattuale euristico."""
-    base_url = url.rstrip("/")
-    if not base_url.startswith(("http://", "https://")):
-        base_url = "https://" + base_url
+    base_url = normalize_url_scheme(url.rstrip("/"))
 
     response, err = fetch_url(base_url)
-    if err or not response:
+    # `response is None`: an HTTP error Response is falsy (requests sets __bool__ to
+    # `ok`), so this used to claim the page was unreachable when it had answered.
+    if err or response is None:
         return FactualAccuracyResult(
             checked=False,
             inconsistencies=[f"Unable to reach {base_url}: {err or 'connection failed'}"],
@@ -266,7 +267,11 @@ def _check_source_links(
     for link in links[: max(0, max_source_checks)]:
         result.source_links_checked += 1
         response, err = fetcher(link)
-        if err or not response:
+        # `response is None`, not `not response`: an HTTP error Response is falsy
+        # (requests sets __bool__ to `ok`). The outcome here was right either way —
+        # a link answering 4xx/5xx is broken — because the status check below
+        # catches it. Being explicit keeps the two cases distinguishable.
+        if err or response is None:
             _append_unique(result.broken_source_links, link)
             continue
 

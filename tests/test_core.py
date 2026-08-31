@@ -65,6 +65,7 @@ from geo_optimizer.core.schema_validator import (
 from geo_optimizer.models.config import (
     AI_BOTS,
     ARTICLE_TYPES,
+    CATEGORY_MAX,
     CATEGORY_PATTERNS,
     CITATION_BOTS,
     HEADERS,
@@ -409,9 +410,10 @@ class TestRobotsParserRFC9309:
 
         robots_content = (
             "User-agent: OAI-SearchBot\nAllow: /\n\n"
-            "User-agent: ClaudeBot\nAllow: /\n\n"
             "User-agent: Claude-SearchBot\nAllow: /\n\n"
-            "User-agent: PerplexityBot\nAllow: /\n"
+            "User-agent: PerplexityBot\nAllow: /\n\n"
+            "User-agent: Googlebot\nAllow: /\n\n"
+            "User-agent: Applebot\nAllow: /\n"
         )
         mock_response = Mock()
         mock_response.status_code = 200
@@ -615,6 +617,23 @@ class TestConfig:
         assert "webapp" in SCHEMA_TEMPLATES
         assert "article" in SCHEMA_TEMPLATES
         assert "organization" in SCHEMA_TEMPLATES
+        assert "howto" in SCHEMA_TEMPLATES
+        assert "review" in SCHEMA_TEMPLATES
+        assert "product" in SCHEMA_TEMPLATES
+
+    def test_schema_templates_howto_review_product_are_valid_shapes(self):
+        """The three templates closing the detect->generate gap (#535-cleanup follow-up)
+        must declare the @type audit_schema.py actually looks for (has_howto/has_product),
+        and Review must nest a Rating, not a bare number (schema.org requires the object)."""
+        assert SCHEMA_TEMPLATES["howto"]["@type"] == "HowTo"
+        assert isinstance(SCHEMA_TEMPLATES["howto"]["step"], list)
+        assert SCHEMA_TEMPLATES["howto"]["step"][0]["@type"] == "HowToStep"
+
+        assert SCHEMA_TEMPLATES["review"]["@type"] == "Review"
+        assert SCHEMA_TEMPLATES["review"]["reviewRating"]["@type"] == "Rating"
+
+        assert SCHEMA_TEMPLATES["product"]["@type"] == "Product"
+        assert SCHEMA_TEMPLATES["product"]["offers"]["@type"] == "Offer"
 
     def test_schema_org_required_has_types(self):
         assert "website" in SCHEMA_ORG_REQUIRED
@@ -1222,6 +1241,13 @@ class TestAuditMetaTags:
         assert result.title_length == len("Test Title")
         assert result.description_length == len("This is the description")
 
+    def test_soup_none_returns_empty_result(self):
+        result = audit_meta_tags(None, "https://example.com")
+        assert result.has_title is False
+        assert result.has_description is False
+        assert result.has_canonical is False
+        assert result.has_og_title is False
+
 
 class TestAuditContentQuality:
     """Tests for audit_content_quality()."""
@@ -1267,6 +1293,13 @@ class TestAuditContentQuality:
         result = audit_content_quality(soup, "https://example.com")
         assert result.numbers_count == 2
         assert result.has_numbers is False
+
+    def test_soup_none_returns_empty_result(self):
+        result = audit_content_quality(None, "https://example.com")
+        assert result.has_h1 is False
+        assert result.word_count == 0
+        assert result.has_numbers is False
+        assert result.has_links is False
 
 
 # ============================================================================
@@ -1544,6 +1577,82 @@ class TestBuildRecommendations:
         assert not any("JSON-LD" in r and "parse" in r.lower() for r in recs)
 
 
+class TestRecommendationsImpactOrdering:
+    """gap #5: with score_breakdown, categories in a bucket sort by recoverable points."""
+
+    def _inputs(self):
+        """Medium bucket gets one meta rec (description) and several schema recs."""
+        return {
+            "base_url": "https://example.com",
+            "robots": RobotsResult(found=True, citation_bots_ok=True),
+            "llms": LlmsTxtResult(found=True, has_sections=True, sections_count=3, has_links=True, links_count=5),
+            "schema": SchemaResult(),  # all schema recs fire (recoverable 16)
+            "meta": MetaResult(
+                has_title=True, has_description=False, has_canonical=True, has_og_title=True, has_og_description=True
+            ),
+            "content": ContentResult(
+                has_numbers=True,
+                has_links=True,
+                has_h1=True,
+                word_count=500,
+                has_heading_hierarchy=True,
+                has_front_loading=True,
+            ),
+        }
+
+    def test_without_breakdown_keeps_static_order(self):
+        recs = build_recommendations(**self._inputs())
+        meta_idx = next(i for i, r in enumerate(recs) if "meta description" in r)
+        schema_idx = next(i for i, r in enumerate(recs) if "WebSite JSON-LD" in r)
+        assert meta_idx < schema_idx  # static order: meta before schema
+
+    def test_with_breakdown_highest_recoverable_first(self):
+        breakdown = {
+            "robots": 18,
+            "llms": 18,
+            "schema": 0,  # 16 points recoverable
+            "meta": 12,  # 2 points recoverable
+            "content": 12,
+            "signals": 6,
+            "ai_discovery": 6,
+            "brand_entity": 10,
+            "negative_penalty": 0,
+        }
+        recs = build_recommendations(**self._inputs(), score_breakdown=breakdown)
+        meta_idx = next(i for i, r in enumerate(recs) if "meta description" in r)
+        schema_idx = next(i for i, r in enumerate(recs) if "WebSite JSON-LD" in r)
+        assert schema_idx < meta_idx  # schema (16 recoverable) outranks meta (2)
+
+    def test_critical_bucket_always_first(self):
+        breakdown = {"robots": 0, "llms": 0, "schema": 0, "meta": 14, "content": 0}
+        recs = build_recommendations(
+            "https://example.com",
+            RobotsResult(),
+            LlmsTxtResult(),
+            SchemaResult(),
+            MetaResult(has_title=True, x_robots_noindex=True, x_robots_tag="noindex"),
+            ContentResult(),
+            score_breakdown=breakdown,
+        )
+        assert "X-Robots-Tag" in recs[0]  # critical stays on top regardless of points
+
+    def test_category_max_in_sync_with_scoring(self):
+        """CATEGORY_MAX must equal the sum of SCORING weights per category."""
+        prefixes = {
+            "robots": "robots_",
+            "llms": "llms_",
+            "schema": "schema_",
+            "meta": "meta_",
+            "content": "content_",
+            "signals": "signals_",
+            "ai_discovery": "ai_discovery_",
+            "brand_entity": "brand_",
+        }
+        for category, prefix in prefixes.items():
+            expected = sum(v for k, v in SCORING.items() if k.startswith(prefix))
+            assert CATEGORY_MAX[category] == expected, f"{category}: {CATEGORY_MAX[category]} != {expected}"
+
+
 # ============================================================================
 # 8. RUN FULL AUDIT (geo_optimizer.core.audit)
 # ============================================================================
@@ -1758,6 +1867,7 @@ class TestFetchSitemap:
         mock_session = MagicMock()
         mock_resp = Mock()
         mock_resp.content = xml.encode()
+        mock_resp.iter_content = Mock(return_value=[xml.encode()])
         mock_resp.raise_for_status = Mock()
         mock_session.get.return_value = mock_resp
         mock_create.return_value = mock_session
@@ -1782,9 +1892,11 @@ class TestFetchSitemap:
         mock_session = MagicMock()
         mock_resp_index = Mock()
         mock_resp_index.content = index_xml.encode()
+        mock_resp_index.iter_content = Mock(return_value=[index_xml.encode()])
         mock_resp_index.raise_for_status = Mock()
         mock_resp_sub = Mock()
         mock_resp_sub.content = sub_xml.encode()
+        mock_resp_sub.iter_content = Mock(return_value=[sub_xml.encode()])
         mock_resp_sub.raise_for_status = Mock()
         mock_session.get.side_effect = [mock_resp_index, mock_resp_sub]
         mock_create.return_value = mock_session
@@ -1812,6 +1924,7 @@ class TestFetchSitemap:
         mock_session = MagicMock()
         mock_resp = Mock()
         mock_resp.content = xml.encode()
+        mock_resp.iter_content = Mock(return_value=[xml.encode()])
         mock_resp.raise_for_status = Mock()
         mock_session.get.return_value = mock_resp
         mock_create.return_value = mock_session
@@ -1820,6 +1933,28 @@ class TestFetchSitemap:
         urls = fetch_sitemap("https://example.com/sitemap.xml", on_status=status_msgs.append)
         assert len(urls) == 1
         assert any("Fetching" in m for m in status_msgs)
+
+    @patch("geo_optimizer.core.llms_generator.create_session_with_retry")
+    def test_oversized_sitemap_aborted_mid_stream(self, mock_create):
+        """A response body over MAX_RESPONSE_SIZE must abort during streaming,
+        not after buffering the whole thing into r.content (DoS guard)."""
+        from geo_optimizer.core.llms_generator import MAX_RESPONSE_SIZE
+
+        mock_session = MagicMock()
+        mock_resp = Mock()
+        mock_resp.raise_for_status = Mock()
+        # Never let the test actually allocate MAX_RESPONSE_SIZE bytes — a
+        # handful of oversized chunks proves the abort triggers mid-stream.
+        chunk = b"x" * 1024
+        n_chunks = (MAX_RESPONSE_SIZE // len(chunk)) + 2
+        mock_resp.iter_content = Mock(return_value=iter([chunk] * n_chunks))
+        mock_session.get.return_value = mock_resp
+        mock_create.return_value = mock_session
+
+        urls = fetch_sitemap("https://example.com/sitemap.xml")
+        assert urls == []
+        # Aborted after exceeding the cap, not after consuming the full iterator
+        assert mock_resp.iter_content.return_value.__length_hint__() > 0  # sanity: iterator wasn't pre-drained
 
 
 class TestGenerateLlmsTxt:
@@ -2155,6 +2290,86 @@ class TestAnalyzeHtmlFile:
         try:
             analysis = analyze_html_file(path)
             assert analysis.found_types == []
+        finally:
+            os.unlink(path)
+
+    def test_analyze_file_unpacks_at_graph(self):
+        """A {"@context", "@graph": [...]} container (Yoast/RankMath default) must not
+        read as a single 'Unknown' schema (#schema-analyze, same class as citability #326)."""
+        html = """<html><head>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@graph":[
+            {"@type":"Organization","name":"Test Org"},
+            {"@type":"WebSite","name":"Test","url":"https://example.com"},
+            {"@type":["WebApplication","SoftwareApplication"],"name":"Test App"}
+        ]}
+        </script>
+        </head><body></body></html>"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as f:
+            f.write(html)
+            f.flush()
+            path = f.name
+
+        try:
+            analysis = analyze_html_file(path)
+            assert "Unknown" not in analysis.found_types
+            assert "Organization" in analysis.found_types
+            assert "WebSite" in analysis.found_types
+            assert "WebApplication" in analysis.found_types
+            assert "webapp" not in analysis.missing
+            assert "website" not in analysis.missing
+        finally:
+            os.unlink(path)
+
+    def test_analyze_file_unpacks_nested_at_graph(self):
+        """#535-cleanup: before the shared utils/jsonld.iter_jsonld_objects() walker,
+        this analyzer only unpacked one level of @graph — unlike citability.py, which
+        already handled nesting. A @graph inside a @graph must not read as 'Unknown'."""
+        html = """<html><head>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@graph":[
+            {"@graph":[{"@type":"Organization","name":"Nested Org"}]},
+            {"@type":"WebSite","name":"Test"}
+        ]}
+        </script>
+        </head><body></body></html>"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as f:
+            f.write(html)
+            f.flush()
+            path = f.name
+
+        try:
+            analysis = analyze_html_file(path)
+            assert "Unknown" not in analysis.found_types
+            assert "Organization" in analysis.found_types
+            assert "WebSite" in analysis.found_types
+        finally:
+            os.unlink(path)
+
+    def test_analyze_file_oversized_script_skipped(self):
+        """#535-cleanup: schema_injector.py had no DoS size guard on JSON-LD scripts
+        before sharing utils/jsonld.iter_jsonld_objects() with audit_schema.py, which
+        has enforced this since fix #182."""
+        from geo_optimizer.models.config import SCHEMA_JSONLD_MAX_BYTES
+
+        oversized_name = "x" * (SCHEMA_JSONLD_MAX_BYTES + 1000)
+        html = f"""<html><head>
+        <script type="application/ld+json">
+        {{"@type":"Organization","name":"{oversized_name}"}}
+        </script>
+        </head><body></body></html>"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as f:
+            f.write(html)
+            f.flush()
+            path = f.name
+
+        try:
+            analysis = analyze_html_file(path)
+            assert "Organization" not in analysis.found_types
+            assert analysis.found_schemas == []
         finally:
             os.unlink(path)
 

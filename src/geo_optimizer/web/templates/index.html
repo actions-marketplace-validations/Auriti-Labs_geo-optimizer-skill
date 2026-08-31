@@ -226,16 +226,182 @@ footer .credit{font-size:.72rem;color:var(--text-muted)}
   .bar-label{width:80px;font-size:.75rem}
   nav{gap:.75rem;flex-wrap:wrap}
 }
+
+/* ─── Floating cookie settings button ─── */
+/* ─── Cookie Banner ─── */
+@keyframes cookieSlideUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:none}}
+.cookie-banner{
+  display:none;
+  position:fixed;bottom:0;left:0;right:0;z-index:9999;
+  padding:1.25rem 2rem;
+  background:linear-gradient(135deg,rgba(13,17,23,0.97) 0%,rgba(17,24,40,0.97) 100%);
+  border-top:1px solid rgba(59,130,246,0.18);
+  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+  box-shadow:0 -8px 40px rgba(0,0,0,0.5),0 -1px 0 rgba(59,130,246,0.08);
+  animation:cookieSlideUp .4s cubic-bezier(.16,1,.3,1) both;
+}
+.cookie-banner-content{
+  max-width:1100px;margin:0 auto;
+  display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap;
+}
+.cookie-banner-icon{
+  flex-shrink:0;width:44px;height:44px;border-radius:12px;
+  background:linear-gradient(135deg,rgba(59,130,246,0.15),rgba(139,92,246,0.15));
+  border:1px solid rgba(59,130,246,0.2);
+  display:flex;align-items:center;justify-content:center;
+  color:#3b82f6;
+}
+.cookie-banner-icon svg{width:22px;height:22px}
+.cookie-banner-text{flex:1;min-width:220px}
+.cookie-banner-title{
+  font-size:.95rem;font-weight:600;color:#e2e8f0;margin-bottom:.25rem;
+  background:linear-gradient(90deg,#e2e8f0,#94a3b8);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+}
+.cookie-banner-description{font-size:.82rem;color:#64748b;line-height:1.55}
+.cookie-banner-link{color:#3b82f6;text-decoration:none;border-bottom:1px solid rgba(59,130,246,0.3);transition:border-color .2s}
+.cookie-banner-link:hover{border-color:#3b82f6}
+.cookie-banner-actions{display:flex;gap:.75rem;flex-shrink:0;align-items:center}
+
+/* ─── Cookie Buttons ─── */
+.cookie-btn{
+  padding:.55rem 1.25rem;border-radius:8px;font-size:.85rem;font-weight:600;
+  cursor:pointer;border:none;font-family:inherit;transition:all .2s;white-space:nowrap;
+}
+.cookie-btn-primary{
+  background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;
+  box-shadow:0 2px 12px rgba(59,130,246,0.3);
+}
+.cookie-btn-primary:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(59,130,246,0.45)}
+.cookie-btn-secondary{
+  background:transparent;color:#94a3b8;
+  border:1px solid rgba(255,255,255,0.1);
+}
+.cookie-btn-secondary:hover{background:rgba(255,255,255,0.05);color:#e2e8f0;border-color:rgba(255,255,255,0.2)}
+
+/* ─── Cookie Modal ─── */
+.cookie-modal{
+  position:fixed;inset:0;z-index:10000;
+  display:none;align-items:center;justify-content:center;padding:1rem;
+  opacity:0;transition:opacity .3s;pointer-events:none;
+}
+.cookie-modal:not([hidden]){display:flex;pointer-events:auto}
+.cookie-modal.active{pointer-events:auto}
+.cookie-modal.active{opacity:1}
+.cookie-modal-overlay{
+  position:absolute;inset:0;
+  background:rgba(0,0,0,0.75);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
+}
+.cookie-modal-content{
+  position:relative;z-index:1;width:100%;max-width:480px;
+  background:linear-gradient(145deg,#0d1117,#111820);
+  border:1px solid rgba(59,130,246,0.15);border-radius:18px;
+  box-shadow:0 24px 80px rgba(0,0,0,0.7),0 0 0 1px rgba(255,255,255,0.04);
+  overflow:hidden;
+  transform:translateY(16px) scale(.98);transition:transform .3s cubic-bezier(.16,1,.3,1);
+}
+.cookie-modal.active .cookie-modal-content{transform:none}
+.cookie-modal-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:1.5rem 1.5rem 1rem;
+  border-bottom:1px solid rgba(255,255,255,0.06);
+}
+.cookie-modal-header h2{
+  font-size:1.1rem;font-weight:700;
+  background:linear-gradient(90deg,#e2e8f0 0%,#8b5cf6 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+}
+.cookie-modal-close{
+  width:32px;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,0.08);
+  background:rgba(255,255,255,0.04);color:#64748b;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:all .2s;
+}
+.cookie-modal-close:hover{background:rgba(255,255,255,0.08);color:#e2e8f0;border-color:rgba(255,255,255,0.15)}
+.cookie-modal-close svg{width:16px;height:16px}
+.cookie-modal-body{padding:1rem 1.5rem;display:flex;flex-direction:column;gap:.75rem}
+.cookie-category{
+  padding:1rem;border-radius:12px;
+  background:rgba(255,255,255,0.025);
+  border:1px solid rgba(255,255,255,0.06);
+  transition:border-color .2s;
+}
+.cookie-category:hover{border-color:rgba(59,130,246,0.15)}
+.cookie-category-header{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:.5rem}
+.cookie-category-header h3{font-size:.875rem;font-weight:600;color:#e2e8f0}
+.cookie-category-desc{font-size:.78rem;color:#475569;line-height:1.6}
+.cookie-modal-footer{
+  display:flex;gap:.75rem;padding:1rem 1.5rem 1.5rem;
+  border-top:1px solid rgba(255,255,255,0.06);
+}
+.cookie-modal-footer .cookie-btn{flex:1}
+
+/* ─── Toggle Switch ─── */
+.cookie-switch{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
+.cookie-switch input{opacity:0;width:0;height:0;position:absolute}
+.cookie-slider{
+  position:absolute;inset:0;border-radius:24px;cursor:pointer;
+  background:#1b2332;border:1px solid rgba(255,255,255,0.08);
+  transition:all .25s;
+}
+.cookie-slider:before{
+  content:'';position:absolute;height:16px;width:16px;
+  left:3px;top:50%;transform:translateY(-50%);
+  border-radius:50%;background:#475569;transition:all .25s;
+}
+input:checked + .cookie-slider{
+  background:linear-gradient(135deg,#3b82f6,#6366f1);
+  border-color:transparent;box-shadow:0 0 12px rgba(59,130,246,0.35);
+}
+input:checked + .cookie-slider:before{transform:translateY(-50%) translateX(20px);background:#fff}
+input:disabled + .cookie-slider{opacity:.5;cursor:not-allowed}
+
+/* ─── Floating cookie button ─── */
+.cookie-float-btn{
+  position:fixed;bottom:1.5rem;left:1.5rem;z-index:9990;
+  width:42px;height:42px;border-radius:50%;
+  background:rgba(13,17,23,0.92);
+  border:1px solid rgba(59,130,246,0.2);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;text-decoration:none;color:#64748b;
+  transition:all .25s;box-shadow:0 4px 20px rgba(0,0,0,0.4);
+}
+.cookie-float-btn:hover{color:#3b82f6;border-color:#3b82f6;box-shadow:0 4px 20px rgba(59,130,246,0.2);transform:scale(1.08)}
+.cookie-float-btn svg{width:18px;height:18px}
+
+@media(max-width:640px){
+  .cookie-banner{padding:1rem}
+  .cookie-banner-content{flex-direction:column;align-items:flex-start;gap:1rem}
+  .cookie-banner-actions{width:100%;justify-content:flex-end}
+  .cookie-modal-content{border-radius:14px}
+}
 </style>
 
 <!-- GEO: Schema JSON-LD -->
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"WebApplication","name":"GEO Optimizer","url":"https://geo-optimizer-web.onrender.com","description":"Open-source toolkit to audit, fix, and optimize websites for AI search engine visibility. Score 0-100 based on 47 research-backed methods.","applicationCategory":"DeveloperApplication","operatingSystem":"Web","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"author":{"@type":"Organization","name":"Auriti Labs","url":"https://github.com/Auriti-Labs","sameAs":["https://github.com/Auriti-Labs","https://pypi.org/project/geo-optimizer-skill/","https://www.linkedin.com/company/auriti-labs","https://www.crunchbase.com/organization/auriti-labs"],"contactPoint":{"@type":"ContactPoint","contactType":"technical support","email":"juancamilo.auriti@gmail.com","url":"https://github.com/Auriti-Labs/geo-optimizer-skill/issues"},"address":{"@type":"PostalAddress","addressCountry":"IT"}}}
+{"@context":"https://schema.org","@type":"WebApplication","name":"GEO Optimizer","url":"https://geoready.dev","description":"Open-source toolkit to audit, fix, and optimize websites for AI search engine visibility. Score 0-100 based on 47 research-backed methods.","applicationCategory":"DeveloperApplication","operatingSystem":"Web","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"author":{"@type":"Organization","name":"Auriti Labs","url":"https://github.com/Auriti-Labs","sameAs":["https://github.com/Auriti-Labs","https://pypi.org/project/geo-optimizer-skill/","https://www.linkedin.com/company/auriti-labs","https://www.crunchbase.com/organization/auriti-labs"],"contactPoint":{"@type":"ContactPoint","contactType":"technical support","email":"juancamilo.auriti@gmail.com","url":"https://github.com/Auriti-Labs/geo-optimizer-skill/issues"},"address":{"@type":"PostalAddress","addressCountry":"IT"}}}
 </script>
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is GEO Optimizer?","acceptedAnswer":{"@type":"Answer","text":"GEO Optimizer is an open-source toolkit that audits websites for AI search engine visibility. It scores sites 0-100 based on 47 research-backed methods and generates fixes for robots.txt, llms.txt, JSON-LD schema, and meta tags."}},{"@type":"Question","name":"How does the GEO score work?","acceptedAnswer":{"@type":"Answer","text":"The score is calculated across 8 categories: robots.txt (18pt), llms.txt (18pt), JSON-LD schema (16pt), meta tags (14pt), content quality (12pt), signals (6pt), AI discovery (6pt), brand & entity (10pt). Bands: 86-100 excellent, 68-85 good, 36-67 foundation, 0-35 critical."}},{"@type":"Question","name":"Is GEO Optimizer free?","acceptedAnswer":{"@type":"Answer","text":"Yes, GEO Optimizer is free and open-source under MIT License. Install with: pip install geo-optimizer-skill"}}]}
 </script>
 <link rel="alternate" type="application/rss+xml" title="GEO Optimizer Updates" href="https://github.com/Auriti-Labs/geo-optimizer-skill/releases.atom">
+
+<!-- SEO: Open Graph / Social Media -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="GEO Optimizer — AI Search Visibility Audit">
+<meta property="og:description" content="Audit your website's visibility to AI search engines. Score 0-100 with actionable fixes for ChatGPT, Perplexity, Claude, Gemini.">
+<meta property="og:url" content="https://geoready.dev/">
+<meta property="og:image" content="https://geoready.dev/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:site_name" content="GEO Optimizer">
+<meta property="og:locale" content="en_US">
+
+<!-- SEO: Canonical URL -->
+<link rel="canonical" href="https://geoready.dev/">
+
+<!-- SEO: Canonical URL -->
+<link rel="canonical" href="https://geoready.dev/">
 </head>
 <body>
 <div class="glow-orb blue"></div>
@@ -361,10 +527,253 @@ footer .credit{font-size:.72rem;color:var(--text-muted)}
       <a href="https://pypi.org/project/geo-optimizer-skill/">PyPI</a>
       <a href="https://auriti-labs.github.io/geo-optimizer-skill/">Docs</a>
       <a href="https://github.com/auriti-labs/geo-optimizer-skill/issues">Issues</a>
+      <a href="/privacy">Privacy</a>
     </div>
     <div class="credit">Built by Auriti Labs &#183; Powered by Princeton KDD 2024 + AutoGEO ICLR 2026 research</div>
   </footer>
 </div>
+
+<!-- Cookie Consent Banner - GDPR Compliant -->
+<div id="cookie-banner" class="cookie-banner" role="dialog" aria-live="polite">
+  <div class="cookie-banner-content">
+    <div class="cookie-banner-icon">
+      <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        <path d="M9 10h.01"></path>
+        <path d="M15 10h.01"></path>
+        <path d="M12 14h.01"></path>
+      </svg>
+    </div>
+    <div class="cookie-banner-text">
+      <p class="cookie-banner-title">We respect your privacy</p>
+      <p class="cookie-banner-description">
+        This site uses essential and analytics cookies to deliver a better browsing experience.
+        <a href="/privacy" class="cookie-banner-link">Learn more</a>
+      </p>
+    </div>
+    <div class="cookie-banner-actions">
+      <button type="button" class="cookie-btn cookie-btn-secondary" id="cookie-manage">
+        Manage
+      </button>
+      <button type="button" class="cookie-btn cookie-btn-primary" id="cookie-accept-all">
+        Accept all
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Cookie Settings Modal -->
+<div id="cookie-modal" class="cookie-modal" role="dialog" aria-modal="true" hidden>
+  <div class="cookie-modal-overlay" id="cookie-modal-overlay"></div>
+  <div class="cookie-modal-content">
+    <div class="cookie-modal-header">
+      <h2>Cookie Settings</h2>
+      <button type="button" class="cookie-modal-close" id="cookie-modal-close">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <div class="cookie-modal-body">
+      <div class="cookie-category">
+        <div class="cookie-category-header">
+          <h3>Essential Cookies</h3>
+          <label class="cookie-switch">
+            <input type="checkbox" id="cookie-essential" checked disabled>
+            <span class="cookie-slider"></span>
+          </label>
+        </div>
+        <p class="cookie-category-desc">
+          Strictly necessary for the site to function. They cannot be disabled and include session, security, and preference cookies.
+        </p>
+      </div>
+
+      <div class="cookie-category">
+        <div class="cookie-category-header">
+          <h3>Analytics Cookies</h3>
+          <label class="cookie-switch">
+            <input type="checkbox" id="cookie-analytics">
+            <span class="cookie-slider"></span>
+          </label>
+        </div>
+        <p class="cookie-category-desc">
+          Help us understand how visitors interact with the site. Data is aggregated and anonymous. Disabling them prevents Google Analytics from loading.
+        </p>
+      </div>
+
+      <div class="cookie-category">
+        <div class="cookie-category-header">
+          <h3>Marketing Cookies</h3>
+          <label class="cookie-switch">
+            <input type="checkbox" id="cookie-marketing">
+            <span class="cookie-slider"></span>
+          </label>
+        </div>
+        <p class="cookie-category-desc">
+          Used to serve relevant ads. Disabling them results in less personalised advertising.
+        </p>
+      </div>
+    </div>
+
+    <div class="cookie-modal-footer">
+      <button type="button" class="cookie-btn cookie-btn-secondary" id="cookie-save">
+        Save preferences
+      </button>
+      <button type="button" class="cookie-btn cookie-btn-primary" id="cookie-reject-all">
+        Reject all
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Cookie Consent Styles (injected via script) -->
+<script__NONCE_ATTR__>
+/* ─── Cookie Consent Management ─── */
+(function() {
+  'use strict';
+
+  const COOKIE_CONSENT = 'cookie_consent';
+  const GA_ID = 'G-KV5MQTGFZG';
+  const DEFAULT_CONSENT = { essential: true, analytics: false, marketing: false };
+
+  const banner = document.getElementById('cookie-banner');
+  const modal  = document.getElementById('cookie-modal');
+  const overlay = document.getElementById('cookie-modal-overlay');
+
+  let consent = loadConsent();
+  let consentGiven = hasStoredConsent();
+
+  function loadConsent() {
+    try {
+      const s = localStorage.getItem(COOKIE_CONSENT);
+      if (s) return { ...DEFAULT_CONSENT, ...JSON.parse(s) };
+      const c = document.cookie.split(';').find(c => c.trim().startsWith(COOKIE_CONSENT + '='));
+      if (c) return { ...DEFAULT_CONSENT, ...JSON.parse(decodeURIComponent(c.split('=')[1])) };
+    } catch(e) { console.warn('Cookie consent load error', e); }
+    return { ...DEFAULT_CONSENT };
+  }
+
+  function hasStoredConsent() {
+    try {
+      if (localStorage.getItem(COOKIE_CONSENT)) return true;
+      if (document.cookie.split(';').some(c => c.trim().startsWith(COOKIE_CONSENT + '='))) return true;
+    } catch(e) {}
+    return false;
+  }
+
+  function saveConsent(obj) {
+    try {
+      localStorage.setItem(COOKIE_CONSENT, JSON.stringify(obj));
+      const exp = new Date();
+      exp.setFullYear(exp.getFullYear() + 1);
+      var secure = location.protocol === 'https:' ? ';Secure' : '';
+      document.cookie = COOKIE_CONSENT + '=' + encodeURIComponent(JSON.stringify(obj)) + ';expires=' + exp.toUTCString() + ';path=/;SameSite=Lax' + secure;
+    } catch(e) { console.warn('Cookie consent save error', e); }
+  }
+
+  function showBanner() { banner.style.display = 'flex'; }
+  function hideBanner()  { banner.style.display = 'none'; }
+
+  function openModal() {
+    document.getElementById('cookie-essential').checked = true;
+    document.getElementById('cookie-analytics').checked = consent.analytics;
+    document.getElementById('cookie-marketing').checked = consent.marketing;
+    modal.hidden = false;
+    setTimeout(function() {
+      modal.classList.add('active');
+      if (overlay) overlay.style.opacity = '1';
+      document.getElementById('cookie-analytics').focus();
+    }, 10);
+  }
+
+  function closeModal() {
+    modal.classList.remove('active');
+    if (overlay) overlay.style.opacity = '0';
+    setTimeout(function() { modal.hidden = true; }, 300);
+  }
+
+  function acceptAll() {
+    consent = { essential: true, analytics: true, marketing: true };
+    saveConsent(consent);
+    consentGiven = true;
+    hideBanner();
+    loadGA();
+  }
+
+  function rejectAll() {
+    consent = { essential: true, analytics: false, marketing: false };
+    saveConsent(consent);
+    consentGiven = true;
+    closeModal();
+    hideBanner();
+    disableTracking();
+  }
+
+  function savePreferences() {
+    consent = {
+      essential: true,
+      analytics: document.getElementById('cookie-analytics').checked,
+      marketing: document.getElementById('cookie-marketing').checked
+    };
+    saveConsent(consent);
+    consentGiven = true;
+    closeModal();
+    hideBanner();
+    if (consent.analytics) loadGA(); else disableTracking();
+  }
+
+  function loadGA() {
+    if (!consent.analytics) return;
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+    gtag('js', new Date());
+    gtag('config', GA_ID, { anonymize_ip: true });
+    var s = document.createElement('script');
+    s.src = 'https://www.googletagmanager.com/gtag/js?id=' + GA_ID;
+    s.async = true;
+    document.head.appendChild(s);
+  }
+
+  function disableTracking() {
+    var s = document.querySelector('script[src*="googletagmanager.com"]');
+    if (s) s.remove();
+    document.cookie.split(';').forEach(function(c) {
+      var n = c.trim().split('=')[0];
+      if (n.startsWith('_ga') || n.startsWith('_gcl')) {
+        document.cookie = n + '=;expires=Thu,01 Jan 1970 00:00:00 GMT;path=/;domain=' + location.hostname;
+        document.cookie = n + '=;expires=Thu,01 Jan 1970 00:00:00 GMT;path=/;domain=.' + location.hostname;
+      }
+    });
+  }
+
+  function init() {
+    // Attach listeners always (regardless of prior consent)
+    document.getElementById('cookie-accept-all').addEventListener('click', acceptAll);
+    document.getElementById('cookie-manage').addEventListener('click', openModal);
+    document.getElementById('cookie-reject-all').addEventListener('click', rejectAll);
+    document.getElementById('cookie-save').addEventListener('click', savePreferences);
+    document.getElementById('cookie-modal-close').addEventListener('click', closeModal);
+    if (overlay) overlay.addEventListener('click', closeModal);
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && !modal.hidden) closeModal();
+    });
+
+    if (consentGiven) {
+      hideBanner();
+      loadGA();
+    } else {
+      showBanner();
+    }
+  }
+
+  // Expose globally for floating button
+  window.openCookieModal = openModal;
+
+  init();
+})();
+</script>
 
 <script__NONCE_ATTR__>
 /* ─── Constants ─── */
@@ -586,5 +995,49 @@ document.addEventListener('click',function(){
   });
 });
 </script>
+
+<!-- Floating cookie settings button: apre il modal delle preferenze -->
+<button type="button" id="cookie-float-btn" class="cookie-float-btn" title="Cookie settings" aria-label="Cookie settings" style="display:none">
+  <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5"/>
+    <circle cx="8" cy="9" r="1.5" fill="currentColor"/>
+    <circle cx="15" cy="8" r="1" fill="currentColor"/>
+    <circle cx="14" cy="14" r="1.5" fill="currentColor"/>
+    <circle cx="9" cy="15" r="1" fill="currentColor"/>
+    <circle cx="17" cy="13" r="1" fill="currentColor"/>
+  </svg>
+</button>
+<script__NONCE_ATTR__>
+(function() {
+  var floatBtn = document.getElementById('cookie-float-btn');
+  var banner = document.getElementById('cookie-banner');
+
+  // Mostra il pulsante solo quando il banner non è visibile
+  function updateFloatBtnVisibility() {
+    if (!floatBtn) return;
+    var bannerVisible = banner && banner.style.display !== 'none' && !banner.hidden;
+    floatBtn.style.display = bannerVisible ? 'none' : 'flex';
+  }
+
+  // Controlla dopo breve delay (il banner usa display/hidden)
+  setTimeout(updateFloatBtnVisibility, 500);
+
+  // Osserva cambiamenti al banner
+  if (banner && window.MutationObserver) {
+    var obs = new MutationObserver(updateFloatBtnVisibility);
+    obs.observe(banner, { attributes: true, attributeFilter: ['style', 'hidden'] });
+  }
+
+  // Al click apre il modal cookie se disponibile
+  if (floatBtn) {
+    floatBtn.addEventListener('click', function() {
+      if (typeof window.openCookieModal === 'function') {
+        window.openCookieModal();
+      }
+    });
+  }
+})();
+</script>
+
 </body>
 </html>

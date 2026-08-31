@@ -19,14 +19,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Basic example — audit with JSON output
       - name: Run GEO Audit
         id: geo
         uses: ./
         with:
-          url: https://agencypilot.it
+          url: https://geoready.dev
           min-score: 40
           format: json
 
@@ -56,10 +56,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run GEO Audit (SARIF)
         uses: ./
         with:
-          url: https://agencypilot.it
+          url: https://geoready.dev
           format: sarif

@@ -35,6 +35,7 @@ from geo_optimizer.core.audit_robots import (
 from geo_optimizer.core.audit_schema import audit_schema  # noqa: F401
 from geo_optimizer.core.audit_signals import audit_signals  # noqa: F401
 from geo_optimizer.core.audit_webmcp import _extract_actions, audit_webmcp_readiness  # noqa: F401
+from geo_optimizer.core.intent_mapping import audit_intent_mapping
 from geo_optimizer.core.scoring import (  # noqa: F401 (re-exported for backward compatibility)
     compute_geo_score,
     compute_score_breakdown,
@@ -44,9 +45,11 @@ from geo_optimizer.models.config import (  # noqa: F401 (VALUABLE_SCHEMAS re-exp
     ABOUT_LINK_PATTERNS,
     AI_BOTS,
     AUDIT_TIMEOUT_SECONDS,
+    CATEGORY_MAX,
     CITATION_BOTS,
     CONTENT_MIN_WORDS,
     KEYWORD_STUFFING_THRESHOLD,
+    ROBOTS_KEY_BOTS_DISPLAY,
     SCORE_BANDS,
     SCORING,
     VALUABLE_SCHEMAS,
@@ -62,200 +65,321 @@ from geo_optimizer.models.results import (
     JsRenderingResult,
     LlmsTxtResult,
     MetaResult,
+    MultimodalResult,
     NegativeSignalsResult,
+    PromptInjectionResult,
     RobotsResult,
     SchemaResult,
     SignalsResult,
     WebMcpResult,
 )
 from geo_optimizer.utils.http import fetch_url
+from geo_optimizer.utils.validators import normalize_url_scheme
 
 
 def build_recommendations(
-    base_url,
-    robots,
-    llms,
-    schema,
-    meta,
-    content,
-    ai_discovery=None,
-    signals=None,
-    brand_entity=None,
-    webmcp=None,
-    negative_signals=None,
-    prompt_injection=None,
-) -> list:
-    """Build a prioritized list of recommendations based on audit results."""
-    recommendations = []
+    base_url: str,
+    robots: RobotsResult,
+    llms: LlmsTxtResult,
+    schema: SchemaResult,
+    meta: MetaResult,
+    content: ContentResult,
+    ai_discovery: AiDiscoveryResult | None = None,
+    signals: SignalsResult | None = None,
+    brand_entity: BrandEntityResult | None = None,
+    webmcp: WebMcpResult | None = None,
+    negative_signals: NegativeSignalsResult | None = None,
+    prompt_injection: PromptInjectionResult | None = None,
+    score_breakdown: dict[str, int] | None = None,
+    multimodal: MultimodalResult | None = None,
+) -> list[str]:
+    """Build a prioritized list of recommendations sorted by score impact (gap #5).
 
-    # Fix #453: split robots recommendation — create vs update
-    if not robots.found:
-        recommendations.append("Create robots.txt with Allow rules for AI bots (GPTBot, ClaudeBot, PerplexityBot)")
-    elif not robots.citation_bots_ok:
-        recommendations.append("Update robots.txt to include all AI bots (GPTBot, ClaudeBot, PerplexityBot)")
-    if not llms.found:
-        recommendations.append(
-            f"Create /llms.txt for AI indexing: geo llms --base-url {base_url}. "
-            "Note: llms.txt is an organizational signal, not a proven ranking factor. "
-            "It helps structure content for AI systems."
+    Priority buckets (returned in order):
+      critical → HIGH (robots 18pt, llms 18pt, meta 14pt)
+      → MEDIUM (brand 10pt, schema 13pt, content 12pt, negative penalty)
+      → LOW (signals 6pt, ai_discovery 6pt, webmcp, product)
+
+    When ``score_breakdown`` (from ``compute_score_breakdown``) is provided,
+    categories inside each bucket are reordered by recoverable points
+    (category max minus points earned), so the highest-impact fixes come first.
+    Without it, the static category order above is kept.
+    """
+    _critical: list[str] = []
+    _h_robots: list[str] = []
+    _h_llms: list[str] = []
+    _h_meta: list[str] = []
+    _m_llms: list[str] = []
+    _m_meta: list[str] = []
+    _m_brand: list[str] = []
+    _m_schema: list[str] = []
+    _m_content: list[str] = []
+    _m_negative: list[str] = []
+    _l_signals: list[str] = []
+    _l_content: list[str] = []
+    _l_ai: list[str] = []
+    _l_schema: list[str] = []
+    _l_webmcp: list[str] = []
+    _l_multimodal: list[str] = []
+
+    # ── CRITICAL — blocking signals ─────────────────────────────────────────
+    # gap #2: X-Robots-Tag: noindex via HTTP header
+    if getattr(meta, "x_robots_noindex", False):
+        _critical.append(
+            f"CRITICAL: X-Robots-Tag: {meta.x_robots_tag} detected in HTTP response headers — "
+            "AI crawlers will skip this page entirely. Remove the header or set it to 'all'."
         )
-    elif llms.found:
-        # #247: llms.txt Policy Intelligence — recommendations on content quality
-        if llms.sections_count == 0:
-            recommendations.append(
-                "Add H2 sections to llms.txt to organize content by topic (e.g. ## Features, ## Documentation, ## API)"
-            )
-        if llms.links_count < 3:
-            recommendations.append(
-                f"llms.txt has only {llms.links_count} links. "
-                "Add more markdown links to key pages for better AI indexing coverage."
-            )
-        # #39: add validation warnings to recommendations
-        if hasattr(llms, "validation_warnings"):
-            for warning in llms.validation_warnings:
-                recommendations.append(warning)
-    # Fix #399: report JSON-LD parse errors
-    if schema.json_parse_errors > 0:
-        recommendations.append(
-            f"Found {schema.json_parse_errors} JSON-LD script(s) with parse errors — validate at schema.org/validator"
+    # gap #7: noai in meta robots
+    if getattr(meta, "has_noai", False):
+        _critical.append(
+            f"noai directive detected in meta robots ({meta.noai_value}) — "
+            "some AI search engines respect this and may refuse to cite your content. "
+            "Remove 'noai' to maximize AI citability."
         )
-    if not schema.has_website:
-        recommendations.append("Add WebSite JSON-LD schema to homepage")
-    if not schema.has_faq:
-        recommendations.append("Add FAQPage schema with site FAQs")
-    # Fix #453: missing recommendations for key SCORING signals
-    if not schema.has_organization:
-        recommendations.append("Add Organization JSON-LD schema with name, url, and logo")
-    if not meta.has_title:
-        recommendations.append("Add a <title> tag — the strongest on-page signal for AI search (5 pts)")
-    if not meta.has_description:
-        recommendations.append("Add optimized meta description (150-160 characters)")
-    if not meta.has_canonical:
-        recommendations.append('Add <link rel="canonical"> to prevent duplicate content issues in AI indexing')
-    if not meta.has_og_title or not meta.has_og_description:
-        recommendations.append("Add Open Graph tags (og:title, og:description, og:image) for AI and social previews")
-    if not content.has_h1:
-        recommendations.append("Add a single H1 heading that clearly states the page topic")
-    if content.word_count < 300:
-        recommendations.append("Expand content to 300+ words — AI engines need substance to cite")
-    if not content.has_numbers:
-        recommendations.append("Add numerical data and concrete statistics (+40% AI visibility)")
-    if not content.has_links:
-        recommendations.append("Cite authoritative sources with external links (increase AI credibility)")
-    if hasattr(content, "has_heading_hierarchy") and not content.has_heading_hierarchy:
-        recommendations.append("Add H2/H3 subheadings to structure content for AI extraction")
-    if hasattr(content, "has_front_loading") and not content.has_front_loading:
-        recommendations.append("Front-load key information in the first 30% of content for AI snippet selection")
-
-    # Fix #453: lang attribute recommendation (3 pts)
-    if signals is not None and not signals.has_lang:
-        recommendations.append('Add lang attribute to <html> tag (e.g., lang="en") for AI language detection')
-
-    # #263: Machine-Readable Presence recommendations (RSS + sitemap)
-    if signals is not None and not signals.has_rss:
-        recommendations.append(
-            "Add RSS/Atom feed and link it in <head> with "
-            '<link rel="alternate" type="application/rss+xml"> for AI discovery'
-        )
-
-    # AI discovery recommendations (geo-checklist.dev)
-    if ai_discovery is not None:
-        if not ai_discovery.has_well_known_ai:
-            recommendations.append("Create /.well-known/ai.txt to define AI crawler permissions")
-        if not ai_discovery.has_summary or not ai_discovery.summary_valid:
-            recommendations.append("Create /ai/summary.json with site name and description for AI engines")
-        if not ai_discovery.has_faq:
-            recommendations.append("Create /ai/faq.json with structured FAQ for AI search visibility")
-        if not ai_discovery.has_service:
-            recommendations.append("Create /ai/service.json to describe service capabilities for AI")
-
-    # #232: E-commerce recommendation when Product schema is incomplete
-    if schema.has_product and hasattr(schema, "ecommerce_signals"):
-        signals_dict = schema.ecommerce_signals
-        missing_fields = [k for k, v in signals_dict.items() if not v and k != "complete"]
-        if missing_fields:
-            recommendations.append(
-                f"Complete Product schema: missing {', '.join(missing_fields)}. "
-                "Rich Product schema improves AI shopping visibility."
-            )
-
-    # Brand & Entity recommendations (v4.3)
-    if brand_entity is not None:
-        if not brand_entity.brand_name_consistent and len(brand_entity.names_found) >= 2:
-            recommendations.append("Use consistent brand name across title, og:title, H1, and schema Organization")
-        if brand_entity.kg_pillar_count == 0:
-            recommendations.append(
-                "Add sameAs links in Organization schema to Wikipedia, Wikidata, LinkedIn, or Crunchbase "
-                "for Knowledge Graph disambiguation"
-            )
-        elif brand_entity.kg_pillar_count < 3:
-            recommendations.append(
-                f"Add more sameAs links to Knowledge Graph pillars "
-                f"(currently {brand_entity.kg_pillar_count}/4: Wikipedia, Wikidata, LinkedIn, Crunchbase)"
-            )
-        if not brand_entity.has_about_link:
-            recommendations.append("Add a visible /about or /chi-siamo link to build trust signals for AI")
-        if not brand_entity.has_contact_info:
-            recommendations.append(
-                "Add address, telephone or contactPoint to Organization schema for entity validation"
-            )
-
-    # WebMCP recommendations (#233)
-    if webmcp is not None and webmcp.checked:
-        if webmcp.readiness_level == "none":
-            recommendations.append("Add potentialAction (SearchAction) to WebSite schema for AI agent discoverability")
-        if not webmcp.has_labeled_forms and not webmcp.has_tool_attributes:
-            recommendations.append(
-                "Add descriptive labels to forms (label, aria-label) to make them usable by AI agents"
-            )
-        if not webmcp.has_register_tool and not webmcp.has_tool_attributes:
-            recommendations.append(
-                "Consider adding WebMCP toolname/tooldescription attributes to interactive elements "
-                "for Chrome AI agent support"
-            )
-
-    # Negative Signals recommendations (v4.3)
-    if negative_signals is not None and negative_signals.checked:
-        if negative_signals.cta_density_high:
-            recommendations.append(
-                f"Reduce promotional CTAs ({negative_signals.cta_count} found) "
-                "— AI engines deprioritize overly promotional content"
-            )
-        if negative_signals.is_thin_content:
-            recommendations.append(
-                "Content is thin for the topic promised by H1 — expand to 500+ words for AI citation eligibility"
-            )
-        if negative_signals.has_keyword_stuffing:
-            recommendations.append(
-                f"Keyword stuffing detected: '{negative_signals.stuffed_word}' "
-                f"at {negative_signals.stuffed_density}% density — diversify vocabulary"
-            )
-        if negative_signals.boilerplate_high:
-            recommendations.append(
-                f"High boilerplate ratio ({int(negative_signals.boilerplate_ratio * 100)}%) "
-                "— use <main> tag to help AI extract core content"
-            )
-        if negative_signals.has_mixed_signals:
-            recommendations.append(f"Mixed signals: {negative_signals.mixed_signal_detail}")
-
-    # v4.4: Prompt Injection raccomandazioni (#276)
+    # v4.4: Prompt Injection — critical manipulation patterns
     if prompt_injection is not None and prompt_injection.checked and prompt_injection.severity != "clean":
         if prompt_injection.llm_instruction_found:
-            recommendations.append(
+            _critical.append(
                 "⚠️ CRITICAL: LLM prompt instructions detected in page content — "
                 "this is a manipulation pattern that AI engines actively penalize"
             )
         if prompt_injection.html_comment_injection_found:
-            recommendations.append(
-                "⚠️ Prompt injection in HTML comments detected — AI crawlers read comments, remove them"
-            )
+            _critical.append("⚠️ Prompt injection in HTML comments detected — AI crawlers read comments, remove them")
         if prompt_injection.hidden_text_found:
-            recommendations.append(
+            _critical.append(
                 "Hidden text detected (display:none/visibility:hidden with content) — "
                 "AI crawlers can read it and may penalize this cloaking pattern"
             )
 
-    return recommendations
+    # ── HIGH — robots(18pt), llms(18pt), meta title(5pt) ──────────────────
+    # Fix #453: split robots recommendation — create vs update
+    if not robots.found:
+        _h_robots.append(f"Create robots.txt with Allow rules for AI bots ({ROBOTS_KEY_BOTS_DISPLAY})")
+    elif not robots.citation_bots_ok:
+        _h_robots.append(f"Update robots.txt to include all AI bots ({ROBOTS_KEY_BOTS_DISPLAY})")
+    # gap #8: Crawl-delay slows AI crawlers — flag when > 10s
+    _crawl_delay = getattr(robots, "crawl_delay", None)
+    if _crawl_delay is not None and _crawl_delay > 10:
+        _h_robots.append(
+            f"robots.txt Crawl-delay: {int(_crawl_delay)}s is very aggressive — "
+            "AI crawlers may skip re-indexing your content. Reduce to ≤5s or remove the directive."
+        )
+    if not llms.found:
+        _h_llms.append(
+            f"Create /llms.txt for AI indexing: geo llms --base-url {base_url}. "
+            "Note: llms.txt is an organizational signal, not a proven ranking factor. "
+            "It helps structure content for AI systems."
+        )
+    if not meta.has_title:
+        _h_meta.append("Add a <title> tag — the strongest on-page signal for AI search (5 pts)")
+
+    # ── MEDIUM — meta(9pt), schema(13pt), brand(10pt), content(12pt), negatives ──
+    if llms.found:
+        # #247: llms.txt Policy Intelligence — content quality
+        if llms.sections_count == 0:
+            _m_llms.append(
+                "Add H2 sections to llms.txt to organize content by topic (e.g. ## Features, ## Documentation, ## API)"
+            )
+        if llms.links_count < 3:
+            _m_llms.append(
+                f"llms.txt has only {llms.links_count} links. "
+                "Add more markdown links to key pages for better AI indexing coverage."
+            )
+        if hasattr(llms, "validation_warnings"):
+            for warning in llms.validation_warnings:
+                _m_llms.append(warning)
+
+    # Meta tags (canonical 3pt, og 4pt, description 2pt)
+    if not meta.has_canonical:
+        _m_meta.append('Add <link rel="canonical"> to prevent duplicate content issues in AI indexing')
+    if not meta.has_og_title or not meta.has_og_description:
+        _m_meta.append("Add Open Graph tags (og:title, og:description, og:image) for AI and social previews")
+    if not meta.has_description:
+        _m_meta.append("Add optimized meta description (150-160 characters)")
+
+    # Brand & Entity (up to 10pt)
+    if brand_entity is not None:
+        if not brand_entity.brand_name_consistent and len(brand_entity.names_found) >= 2:
+            _m_brand.append("Use consistent brand name across title, og:title, H1, and schema Organization")
+        if brand_entity.kg_pillar_count == 0:
+            _m_brand.append(
+                "Add sameAs links in Organization schema to Wikipedia, Wikidata, LinkedIn, or Crunchbase "
+                "for Knowledge Graph disambiguation"
+            )
+        elif brand_entity.kg_pillar_count < 3:
+            _m_brand.append(
+                f"Add more sameAs links to Knowledge Graph pillars "
+                f"(currently {brand_entity.kg_pillar_count}/4: Wikipedia, Wikidata, LinkedIn, Crunchbase)"
+            )
+        if not brand_entity.has_about_link:
+            _m_brand.append("Add a visible /about or /chi-siamo link to build trust signals for AI")
+        if not brand_entity.has_contact_info:
+            _m_brand.append("Add address, telephone or contactPoint to Organization schema for entity validation")
+
+    # Schema JSON-LD (up to 13pt)
+    if schema.json_parse_errors > 0:
+        _m_schema.append(
+            f"Found {schema.json_parse_errors} JSON-LD script(s) with parse errors — validate at schema.org/validator"
+        )
+    if not schema.has_website:
+        _m_schema.append("Add WebSite JSON-LD schema to homepage")
+    if not schema.has_organization:
+        _m_schema.append("Add Organization JSON-LD schema with name, url, and logo")
+    if not schema.has_faq:
+        _m_schema.append("Add FAQPage schema with site FAQs")
+    # gap #3: schema completeness
+    for schema_type, missing_fields in getattr(schema, "schema_missing_fields", {}).items():
+        _m_schema.append(
+            f"Incomplete {schema_type} schema: add required fields {', '.join(missing_fields)} "
+            f"(see schema.org/{schema_type} for the full spec)"
+        )
+
+    # Content (up to 12pt)
+    if not content.has_h1:
+        _m_content.append("Add a single H1 heading that clearly states the page topic")
+    if content.word_count < CONTENT_MIN_WORDS:
+        _m_content.append("Expand content to 300+ words — AI engines need substance to cite")
+    if hasattr(content, "has_heading_hierarchy") and not content.has_heading_hierarchy:
+        _m_content.append("Add H2/H3 subheadings to structure content for AI extraction")
+    if hasattr(content, "has_front_loading") and not content.has_front_loading:
+        _m_content.append("Front-load key information in the first 30% of content for AI snippet selection")
+
+    # Negative signals (score penalty reduction)
+    if negative_signals is not None and negative_signals.checked:
+        if negative_signals.cta_density_high:
+            _m_negative.append(
+                f"Reduce promotional CTAs ({negative_signals.cta_count} found) "
+                "— AI engines deprioritize overly promotional content"
+            )
+        if negative_signals.is_thin_content:
+            _m_negative.append(
+                "Content is thin for the topic promised by H1 — expand to 500+ words for AI citation eligibility"
+            )
+        if negative_signals.has_keyword_stuffing:
+            _m_negative.append(
+                f"Keyword stuffing detected: '{negative_signals.stuffed_word}' "
+                f"at {negative_signals.stuffed_density}% density — diversify vocabulary"
+            )
+        if negative_signals.boilerplate_high:
+            _m_negative.append(
+                f"High boilerplate ratio ({int(negative_signals.boilerplate_ratio * 100)}%) "
+                "— use <main> tag to help AI extract core content"
+            )
+        if negative_signals.has_mixed_signals:
+            _m_negative.append(f"Mixed signals: {negative_signals.mixed_signal_detail}")
+
+    # ── LOW — signals(6pt), ai_discovery(6pt), content details(2pt), webmcp ──
+    # Signals (lang 3pt, rss 2pt)
+    if signals is not None and not signals.has_lang:
+        _l_signals.append('Add lang attribute to <html> tag (e.g., lang="en") for AI language detection')
+    if signals is not None and not signals.has_rss:
+        _l_signals.append(
+            "Add RSS/Atom feed and link it in <head> with "
+            '<link rel="alternate" type="application/rss+xml"> for AI discovery'
+        )
+
+    # Content details (numbers 1pt, links 1pt)
+    if not content.has_numbers:
+        _l_content.append("Add numerical data and concrete statistics (+40% AI visibility)")
+    if not content.has_links:
+        _l_content.append("Cite authoritative sources with external links (increase AI credibility)")
+
+    # AI discovery (up to 6pt)
+    if ai_discovery is not None:
+        if not ai_discovery.has_well_known_ai:
+            _l_ai.append("Create /.well-known/ai.txt to define AI crawler permissions")
+        if not ai_discovery.has_summary or not ai_discovery.summary_valid:
+            _l_ai.append("Create /ai/summary.json with site name and description for AI engines")
+        if not ai_discovery.has_faq:
+            _l_ai.append("Create /ai/faq.json with structured FAQ for AI search visibility")
+        if not ai_discovery.has_service:
+            _l_ai.append("Create /ai/service.json to describe service capabilities for AI")
+
+    # Product schema (informational)
+    if schema.has_product and hasattr(schema, "ecommerce_signals"):
+        signals_dict = schema.ecommerce_signals
+        missing_fields = [k for k, v in signals_dict.items() if not v and k != "complete"]
+        if missing_fields:
+            _l_schema.append(
+                f"Complete Product schema: missing {', '.join(missing_fields)}. "
+                "Rich Product schema improves AI shopping visibility."
+            )
+
+    # WebMCP (informational)
+    if webmcp is not None and webmcp.checked:
+        if webmcp.readiness_level == "none":
+            _l_webmcp.append("Add potentialAction (SearchAction) to WebSite schema for AI agent discoverability")
+        if not webmcp.has_labeled_forms and not webmcp.has_tool_attributes:
+            _l_webmcp.append("Add descriptive labels to forms (label, aria-label) to make them usable by AI agents")
+        if not webmcp.has_register_tool and not webmcp.has_tool_attributes:
+            _l_webmcp.append(
+                "Consider adding WebMCP toolname/tooldescription attributes to interactive elements "
+                "for Chrome AI agent support"
+            )
+
+    # Multimodal readiness (informational) — multimodal engines reach non-text
+    # content through its text scaffolding
+    if multimodal is not None and multimodal.checked:
+        if multimodal.total_images and multimodal.alt_coverage < 0.8:
+            missing_alts = multimodal.total_images - multimodal.images_with_alt
+            _l_multimodal.append(
+                f"{missing_alts} of {multimodal.total_images} images lack descriptive alt text — "
+                "multimodal AI engines (Gemini, GPT-4o) read images through their alt text"
+            )
+        if multimodal.has_video and not multimodal.has_video_schema:
+            _l_multimodal.append(
+                "Video detected without VideoObject schema — add name, description, thumbnailUrl, "
+                "and uploadDate so AI engines can cite your video content"
+            )
+        if multimodal.has_video and not (multimodal.has_video_captions or multimodal.has_transcript):
+            _l_multimodal.append(
+                'Video without captions or transcript — add <track kind="captions"> or a text '
+                "transcript: AI engines index the transcript, not the pixels"
+            )
+        if multimodal.has_audio and not (multimodal.has_audio_schema or multimodal.has_transcript):
+            _l_multimodal.append(
+                "Audio content without AudioObject/PodcastEpisode schema or transcript — "
+                "add one to make it citable by AI engines"
+            )
+
+    # gap #5: order categories inside each bucket by recoverable points
+    high_segs: list[tuple[str | None, list[str]]] = [
+        ("robots", _h_robots),
+        ("llms", _h_llms),
+        ("meta", _h_meta),
+    ]
+    medium_segs: list[tuple[str | None, list[str]]] = [
+        ("llms", _m_llms),
+        ("meta", _m_meta),
+        ("brand_entity", _m_brand),
+        ("schema", _m_schema),
+        ("content", _m_content),
+        ("negative_penalty", _m_negative),
+    ]
+    low_segs: list[tuple[str | None, list[str]]] = [
+        ("signals", _l_signals),
+        ("content", _l_content),
+        ("ai_discovery", _l_ai),
+        ("schema", _l_schema),
+        (None, _l_webmcp),
+        (None, _l_multimodal),
+    ]
+
+    def _recoverable(category: str | None) -> int:
+        if score_breakdown is None or category is None:
+            return 0
+        if category == "negative_penalty":
+            # Penalty is stored as a negative value: recoverable = its magnitude
+            return -score_breakdown.get(category, 0)
+        return CATEGORY_MAX.get(category, 0) - max(0, score_breakdown.get(category, 0))
+
+    def _flatten(segs: list[tuple[str | None, list[str]]]) -> list[str]:
+        if score_breakdown is not None:
+            # sorted() is stable: ties keep the static category order
+            segs = sorted(segs, key=lambda seg: _recoverable(seg[0]), reverse=True)
+        return [rec for _, seg in segs for rec in seg]
+
+    return _critical + _flatten(high_segs) + _flatten(medium_segs) + _flatten(low_segs)
 
 
 def _build_audit_result(
@@ -276,6 +400,7 @@ def _build_audit_result(
     js_rendering=None,  # v4.2: JS Rendering check (#226)
     brand_entity=None,  # v4.3: Brand & Entity signals
     webmcp=None,  # v4.3: WebMCP Readiness check (#233)
+    multimodal=None,  # Multimodal readiness (informational)
     negative_signals=None,  # v4.3: Negative Signals detection
     prompt_injection=None,  # v4.4: Prompt Injection Detection (#276)
     trust_stack=None,  # v4.5: Trust Stack Score (#273)
@@ -285,6 +410,8 @@ def _build_audit_result(
     platform_citation=None,  # v4.7: Multi-Platform Citation Profile (#228)
     context_window=None,  # v4.9: Context Window Optimization (#370)
     instruction_readiness=None,  # v4.9: Instruction Following Readiness (#371)
+    intent_mapping=None,  # v4.10: AI Search Intent Mapping (#385)
+    hallucination_bait=None,  # v4.10: Hallucination Bait Detection (#377)
 ) -> AuditResult:
     """Build AuditResult from sub-audits (fix #97: shared sync/async logic).
 
@@ -321,6 +448,16 @@ def _build_audit_result(
 
     # v4.3: use empty WebMcpResult if not provided (#233)
     effective_webmcp = webmcp if webmcp is not None else WebMcpResult()
+
+    # Multimodal readiness: compute from soup if not provided, else empty
+    if multimodal is not None:
+        effective_multimodal = multimodal
+    elif soup is not None:
+        from geo_optimizer.core.audit_multimodal import audit_multimodal_readiness
+
+        effective_multimodal = audit_multimodal_readiness(soup, schema)
+    else:
+        effective_multimodal = MultimodalResult()
 
     # v4.3: use empty NegativeSignalsResult if not provided
     effective_negative_signals = negative_signals if negative_signals is not None else NegativeSignalsResult()
@@ -395,12 +532,50 @@ def _build_audit_result(
 
         effective_instruction = InstructionReadinessResult()
 
-    # Compute score, breakdown, and band (v4.0: includes signals, ai_discovery)
+    # v4.10: AI Search Intent Mapping (#385) — compute if not pre-computed
+    if intent_mapping is not None:
+        effective_intent = intent_mapping
+    elif soup is not None:
+        effective_intent = audit_intent_mapping(soup, "", content, meta, schema)
+    else:
+        from geo_optimizer.models.results import IntentMappingResult
+
+        effective_intent = IntentMappingResult()
+
+    # v4.10: Hallucination Bait Detection (#377) — compute if not pre-computed
+    if hallucination_bait is not None:
+        effective_hallucination = hallucination_bait
+    elif soup is not None:
+        from geo_optimizer.core.hallucination_bait import audit_hallucination_bait
+
+        effective_hallucination = audit_hallucination_bait(soup, "", content, meta, schema)
+    else:
+        from geo_optimizer.models.results import HallucinationBaitResult
+
+        effective_hallucination = HallucinationBaitResult()
+
+    # Compute score, breakdown, and band (v4.0: includes signals, ai_discovery, negative_penalty)
     score = compute_geo_score(
-        robots, llms, schema, meta, content, effective_signals, effective_ai_discovery, effective_brand_entity
+        robots,
+        llms,
+        schema,
+        meta,
+        content,
+        effective_signals,
+        effective_ai_discovery,
+        effective_brand_entity,
+        effective_negative_signals,
     )
     breakdown = compute_score_breakdown(
-        robots, llms, schema, meta, content, effective_signals, effective_ai_discovery, effective_brand_entity
+        robots,
+        llms,
+        schema,
+        meta,
+        content,
+        effective_signals,
+        effective_ai_discovery,
+        effective_brand_entity,
+        effective_negative_signals,
     )
     band = get_score_band(score)
 
@@ -418,6 +593,8 @@ def _build_audit_result(
         effective_webmcp,
         effective_negative_signals,
         effective_prompt_injection,
+        score_breakdown=breakdown,
+        multimodal=effective_multimodal,
     )
 
     # Fix #460: load entry_point plugins if not already loaded (API + MCP callers)
@@ -455,7 +632,7 @@ def _build_audit_result(
         cdn_name = effective_cdn.cdn_detected or "CDN/WAF"
         recommendations.append(
             f"⚠️ {cdn_name.upper()} blocks AI crawlers: {', '.join(blocked_bots)}. "
-            "Configure your CDN to allow AI bot User-Agents (GPTBot, ClaudeBot, PerplexityBot)."
+            f"Configure your CDN to allow AI bot User-Agents ({ROBOTS_KEY_BOTS_DISPLAY})."
         )
 
     if effective_js.checked and effective_js.js_dependent:
@@ -485,6 +662,7 @@ def _build_audit_result(
         js_rendering=effective_js,
         brand_entity=effective_brand_entity,
         webmcp=effective_webmcp,
+        multimodal=effective_multimodal,
         negative_signals=effective_negative_signals,
         prompt_injection=effective_prompt_injection,
         trust_stack=effective_trust_stack,
@@ -493,6 +671,8 @@ def _build_audit_result(
         content_decay=effective_decay,
         context_window=effective_context_window,
         instruction_readiness=effective_instruction,
+        intent_mapping=effective_intent,
+        hallucination_bait=effective_hallucination,
     )
 
     # v4.7: Multi-Platform Citation Profile (#228) — computed post-construction
@@ -510,6 +690,7 @@ def _build_audit_result(
             citability=citability,
             signals=effective_signals,
             ai_discovery=effective_ai_discovery,
+            js_rendering=effective_js,
         )
 
     return result
@@ -532,12 +713,10 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
         effective_bots.update(project_config.extra_bots)
 
     # Normalize URL
-    base_url = url.rstrip("/")
-    if not base_url.startswith(("http://", "https://")):
-        base_url = "https://" + base_url
+    base_url = normalize_url_scheme(url.rstrip("/"))
 
     # Fetch homepage (with optional cache)
-    r: CachedResponse | None
+    # r is CachedResponse (disk cache hit) or requests.Response (live fetch)
     err: str | None
     if use_cache:
         from geo_optimizer.utils.cache import FileCache
@@ -555,17 +734,21 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
             )
             err = None
         else:
-            r, err = fetch_url(base_url)
+            r, err = fetch_url(base_url)  # type: ignore[assignment]
             if r and not err:
                 cache.put(base_url, r.status_code, r.text, dict(r.headers))
     else:
-        r, err = fetch_url(base_url)
-    if err or not r:
+        r, err = fetch_url(base_url)  # type: ignore[assignment]
+    # `r is None`, not `not r`: requests.Response.__bool__ is `ok`, so any 4xx/5xx
+    # is falsy and would land here — reporting "Connection failed" for a request
+    # that succeeded, and skipping the status branch below that exists to name the
+    # code and point at a WAF. Fixes the 403 reported as a connection error.
+    if err or r is None:
         result = AuditResult(
             url=base_url,
             error=str(err) if err else "Connection failed",
         )
-        result.recommendations = [f"Unable to reach {base_url}: {err}"]
+        result.recommendations = [f"Unable to reach {base_url}: {err or 'connection failed'}"]
         result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
         return result
 
@@ -616,6 +799,15 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
     llms = _audit_llms_from_response(r_llms, r_full=r_llms_full)
     schema = audit_schema(soup, base_url)
     meta = audit_meta_tags(soup, base_url)
+    # gap #2: X-Robots-Tag HTTP header — blocks AI indexing even when robots.txt allows it
+    try:
+        _x_robots = dict(r.headers).get("x-robots-tag") or dict(r.headers).get("X-Robots-Tag") or ""
+    except (TypeError, AttributeError):
+        _x_robots = ""
+    if _x_robots:
+        meta.x_robots_tag = _x_robots
+        if "noindex" in _x_robots.lower():
+            meta.x_robots_noindex = True
     content = audit_content_quality(soup, base_url, soup_clean=soup_clean)
 
     # v4.1: AI discovery endpoints audit (usa risposte pre-scaricate)
@@ -631,8 +823,8 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
     # v4.3: Brand & Entity signals (zero HTTP requests, uses pre-fetched data only)
     brand_entity_result = audit_brand_entity(soup, schema, meta, content)
 
-    # v4.3: WebMCP Readiness check (#233) — zero HTTP fetch
-    webmcp_result = audit_webmcp_readiness(soup, r.text, schema)
+    # v4.3: WebMCP Readiness check (#233) — zero extra HTTP fetch (#535: ai_disc reused)
+    webmcp_result = audit_webmcp_readiness(soup, r.text, schema, ai_disc)
 
     # v4.3: Negative Signals detection — zero HTTP fetch
     negative_signals_result = audit_negative_signals(soup, r.text, content, meta, schema)
@@ -682,6 +874,19 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
         prompt_injection=prompt_injection_result,
         trust_stack=trust_stack_result,
     )
+
+    # gap #10: brand sentiment analysis — opt-in, requires project_config.brand_name
+    _brand_name = getattr(project_config, "brand_name", None)
+    if _brand_name:
+        from geo_optimizer.core.audit_sentiment import audit_brand_sentiment
+
+        result.brand_sentiment = audit_brand_sentiment(
+            _brand_name,
+            provider=getattr(project_config, "llm_provider", None),
+            api_key=getattr(project_config, "llm_api_key", None),
+            model=getattr(project_config, "llm_model", None),
+        )
+
     result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
     if result.audit_duration_ms > AUDIT_TIMEOUT_SECONDS * 1000:
         logging.getLogger(__name__).warning(
@@ -695,6 +900,9 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
 
     Runs homepage, robots.txt and llms.txt in parallel for a
     2-3x speedup compared to the synchronous version.
+
+    Note: disk cache (``use_cache``) is not supported in the async path.
+    Use ``run_full_audit(url, use_cache=True)`` when caching is needed.
 
     Args:
         url: URL of the site to analyze.
@@ -713,9 +921,7 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
         effective_bots.update(project_config.extra_bots)
 
     # Normalize URL
-    base_url = url.rstrip("/")
-    if not base_url.startswith(("http://", "https://")):
-        base_url = "https://" + base_url
+    base_url = normalize_url_scheme(url.rstrip("/"))
 
     # Parallel fetch: homepage + robots.txt + llms.txt + llms-full.txt + AI discovery
     robots_url = urljoin(base_url, "/robots.txt")
@@ -791,6 +997,15 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
     # Sub-audits that work on the DOM (no additional fetch required)
     schema = audit_schema(soup, base_url)
     meta = audit_meta_tags(soup, base_url)
+    # gap #2: X-Robots-Tag HTTP header — blocks AI indexing even when robots.txt allows it
+    try:
+        _x_robots_async = dict(r_home.headers).get("x-robots-tag") or dict(r_home.headers).get("X-Robots-Tag") or ""
+    except (TypeError, AttributeError):
+        _x_robots_async = ""
+    if _x_robots_async:
+        meta.x_robots_tag = _x_robots_async
+        if "noindex" in _x_robots_async.lower():
+            meta.x_robots_noindex = True
     content = audit_content_quality(soup, base_url, soup_clean=soup_clean)
 
     # v4.1: AI discovery from pre-fetched responses
@@ -807,8 +1022,8 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
     # v4.3: Brand & Entity signals (zero HTTP requests, uses pre-fetched data only)
     brand_entity_result = audit_brand_entity(soup, schema, meta, content)
 
-    # v4.3: WebMCP Readiness check (#233) — zero HTTP fetch
-    webmcp_result = audit_webmcp_readiness(soup, r_home.text, schema)
+    # v4.3: WebMCP Readiness check (#233) — zero extra HTTP fetch (#535: ai_disc reused)
+    webmcp_result = audit_webmcp_readiness(soup, r_home.text, schema, ai_disc)
 
     # v4.3: Negative Signals detection — zero HTTP fetch
     negative_signals_result = audit_negative_signals(soup, r_home.text, content, meta, schema)
@@ -858,6 +1073,20 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
         prompt_injection=prompt_injection_result,
         trust_stack=trust_stack_result,
     )
+
+    # gap #10: brand sentiment analysis — opt-in, requires project_config.brand_name
+    _brand_name = getattr(project_config, "brand_name", None)
+    if _brand_name:
+        from geo_optimizer.core.audit_sentiment import audit_brand_sentiment
+
+        result.brand_sentiment = await asyncio.to_thread(
+            audit_brand_sentiment,
+            _brand_name,
+            provider=getattr(project_config, "llm_provider", None),
+            api_key=getattr(project_config, "llm_api_key", None),
+            model=getattr(project_config, "llm_model", None),
+        )
+
     result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
     if result.audit_duration_ms > AUDIT_TIMEOUT_SECONDS * 1000:
         logging.getLogger(__name__).warning(

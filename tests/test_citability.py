@@ -7,10 +7,15 @@ detection e scoring. Zero chiamate HTTP.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from bs4 import BeautifulSoup
 
 from geo_optimizer.core.citability import (
     audit_citability,
+    detect_accessibility_signals,
+    detect_anchor_text_quality,
+    detect_answer_capsule,
     detect_attribution,
     detect_authoritative_tone,
     detect_blog_structure,
@@ -22,40 +27,37 @@ from geo_optimizer.core.citability import (
     detect_comparison_content,
     detect_content_decay,
     detect_content_freshness,
+    detect_conversion_funnel,
+    detect_crawl_budget,
     detect_definition_patterns,
     detect_easy_to_understand,
     detect_eeat,
+    detect_entity_disambiguation,
+    detect_entity_resolution,
     detect_faq_in_content,
+    detect_first_party_data,
     detect_fluency,
     detect_format_mix,
     detect_image_alt_quality,
+    detect_international_geo,
     detect_keyword_stuffing,
+    detect_kg_density,
+    detect_multi_platform,
     detect_negative_signals,
     detect_nuance_signals,
     detect_quotations,
     detect_readability,
+    detect_retrieval_triggers,
     detect_shopping_readiness,
     detect_snippet_ready,
+    detect_social_proof,
+    detect_stale_data,
     detect_statistics,
     detect_technical_terms,
+    detect_temporal_coherence,
+    detect_token_efficiency,
     detect_unique_words,
     detect_voice_search,
-    detect_multi_platform,
-    detect_entity_disambiguation,
-    detect_first_party_data,
-    detect_stale_data,
-    detect_social_proof,
-    detect_accessibility_signals,
-    detect_conversion_funnel,
-    detect_temporal_coherence,
-    detect_anchor_text_quality,
-    detect_international_geo,
-    detect_crawl_budget,
-    detect_answer_capsule,
-    detect_token_efficiency,
-    detect_entity_resolution,
-    detect_kg_density,
-    detect_retrieval_triggers,
 )
 
 
@@ -308,9 +310,9 @@ class TestUniqueWords:
     def test_vocabolario_ricco(self):
         # Genera testo con parole diverse
         words = [
-            f"technology innovation digital transformation artificial intelligence"
-            f" machine learning neural network optimization algorithm performance"
-            f" database infrastructure architecture deployment monitoring"
+            "technology innovation digital transformation artificial intelligence"
+            " machine learning neural network optimization algorithm performance"
+            " database infrastructure architecture deployment monitoring"
             for _ in range(10)
         ]
         html = f"<html><body><p>{' '.join(words)}</p></body></html>"
@@ -473,12 +475,14 @@ class TestImageAltQuality:
 
 class TestContentFreshness:
     def test_json_ld_recente(self):
-        html = """
+        recent = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        published = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
+        html = f"""
         <html><body>
             <script type="application/ld+json">
-            {"@type": "Article", "dateModified": "2026-03-01", "datePublished": "2025-12-01"}
+            {{"@type": "Article", "dateModified": "{recent}", "datePublished": "{published}"}}
             </script>
-            <p>In 2026, AI search engines dominate.</p>
+            <p>AI search engines dominate.</p>
         </body></html>
         """
         result = detect_content_freshness(_soup(html))
@@ -504,55 +508,39 @@ class TestContentFreshness:
 
     # ── Test freshness_level graduated (#401) ────────────────────────────────
 
-    def test_freshness_level_very_fresh_1_mese(self):
-        """Date 1 month ago → freshness_level = very_fresh, 4 citability points."""
-        html = """
+    @staticmethod
+    def _article_html_days_ago(days: int) -> str:
+        """Build Article JSON-LD with dateModified `days` ago (relative to today)."""
+        date_str = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        return f"""
         <html><body>
             <script type="application/ld+json">
-            {"@type": "Article", "dateModified": "2026-03-01"}
+            {{"@type": "Article", "dateModified": "{date_str}"}}
             </script>
         </body></html>
         """
-        result = detect_content_freshness(_soup(html))
+
+    def test_freshness_level_very_fresh_1_mese(self):
+        """Date ~1 month ago → freshness_level = very_fresh, 4 citability points."""
+        result = detect_content_freshness(_soup(self._article_html_days_ago(30)))
         assert result.details["freshness_level"] == "very_fresh"
         assert result.details["is_fresh"] is True
 
     def test_freshness_level_fresh_4_mesi(self):
-        """Date 4 months ago → freshness_level = fresh, 3 citability points."""
-        html = """
-        <html><body>
-            <script type="application/ld+json">
-            {"@type": "Article", "dateModified": "2025-12-01"}
-            </script>
-        </body></html>
-        """
-        result = detect_content_freshness(_soup(html))
+        """Date ~4 months ago → freshness_level = fresh, 3 citability points."""
+        result = detect_content_freshness(_soup(self._article_html_days_ago(135)))
         assert result.details["freshness_level"] == "fresh"
         assert result.details["is_fresh"] is True
 
     def test_freshness_level_aging_8_mesi(self):
-        """Date 8 months ago → freshness_level = aging, 2 citability points."""
-        html = """
-        <html><body>
-            <script type="application/ld+json">
-            {"@type": "Article", "dateModified": "2025-08-01"}
-            </script>
-        </body></html>
-        """
-        result = detect_content_freshness(_soup(html))
+        """Date ~8 months ago → freshness_level = aging, 2 citability points."""
+        result = detect_content_freshness(_soup(self._article_html_days_ago(270)))
         assert result.details["freshness_level"] == "aging"
         assert result.details["is_fresh"] is False
 
     def test_freshness_level_stale_14_mesi(self):
-        """Date 14 months ago → freshness_level = stale, 0 citability points."""
-        html = """
-        <html><body>
-            <script type="application/ld+json">
-            {"@type": "Article", "dateModified": "2025-02-01"}
-            </script>
-        </body></html>
-        """
-        result = detect_content_freshness(_soup(html))
+        """Date ~14 months ago → freshness_level = stale, 0 citability points."""
+        result = detect_content_freshness(_soup(self._article_html_days_ago(420)))
         assert result.details["freshness_level"] == "stale"
         assert result.details["is_fresh"] is False
 
@@ -847,6 +835,68 @@ class TestEeat:
         assert result.details["trust_link_count"] == 0
         assert result.score == 0
 
+    def test_structured_author_with_sameas_scores_higher_than_bio_text(self):
+        """A verifiable Person + sameAs is a stronger, checkable claim than prose."""
+        html = """
+        <html><body>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article","headline":"Test",
+         "author":{"@type":"Person","name":"Jane Doe","sameAs":["https://linkedin.com/in/janedoe"]}}
+        </script>
+        </body></html>
+        """
+        result = detect_eeat(_soup(html))
+        assert result.detected is True
+        assert result.details["has_structured_author"] is True
+        assert result.details["has_verified_author"] is True
+        assert result.score == 2
+
+    def test_structured_author_without_sameas_scores_less(self):
+        html = """
+        <html><body>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article","headline":"Test",
+         "author":{"@type":"Person","name":"Jane Doe"}}
+        </script>
+        </body></html>
+        """
+        result = detect_eeat(_soup(html))
+        assert result.details["has_structured_author"] is True
+        assert result.details["has_verified_author"] is False
+        assert result.score == 1
+
+    def test_author_as_plain_string_not_credited_as_structured(self):
+        """A string author (not a Person object) carries no verifiable claim."""
+        html = """
+        <html><body>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Article","headline":"Test","author":"Jane Doe"}
+        </script>
+        </body></html>
+        """
+        result = detect_eeat(_soup(html))
+        assert result.details["has_structured_author"] is False
+        assert result.score == 0
+
+    def test_max_score_is_7_with_all_signals(self):
+        html = """
+        <html><body>
+            <a href="/privacy-policy">Privacy Policy</a>
+            <a href="/terms-of-service">Terms of Service</a>
+            <a href="/about">About Us</a>
+            <a href="/contact">Contact</a>
+            <link rel="canonical" href="https://example.com/page">
+            <div class="author-bio">Jane Doe has 12 years of professional experience in this field.</div>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Article","headline":"Test",
+             "author":{"@type":"Person","name":"Jane Doe","sameAs":["https://linkedin.com/in/janedoe"]}}
+            </script>
+        </body></html>
+        """
+        result = detect_eeat(_soup(html))
+        assert result.max_score == 7
+        assert result.score == 7
+
 
 # ============================================================================
 # TEST: Content Decay Detection (-10%) — Batch 2
@@ -855,12 +905,13 @@ class TestEeat:
 
 class TestContentDecay:
     def test_contenuto_aggiornato(self):
-        html = """
+        recent = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        html = f"""
         <html><body>
             <script type="application/ld+json">
-            {"@type": "Article", "dateModified": "2026-02-01"}
+            {{"@type": "Article", "dateModified": "{recent}"}}
             </script>
-            <p>In 2026, AI search is evolving rapidly.</p>
+            <p>AI search is evolving rapidly.</p>
         </body></html>
         """
         result = detect_content_decay(_soup(html))
@@ -1176,10 +1227,25 @@ class TestWeightSum:
         html = "<html><body><p>Test content.</p></body></html>"
         result = audit_citability(_soup(html), "https://example.com")
         # 18 base=100, 7 batch2=31, 5 batch3+4=18, 8 batchA=27, 4 batchB=13, 5 RAG=19 → 208
+        # +2 for eeat_signals' structured-author credit (Person + sameAs) → 210
         total_max = sum(m.max_score for m in result.methods)
-        assert total_max == 208, f"Somma max_score = {total_max}, atteso 208 (189 precedenti + 19 RAG batch)"
-        # Ma il total_score è sempre cappato a 100
-        assert result.total_score <= 100
+        assert total_max == 210, f"max_score sum = {total_max}, expected 210 (208 + 2 for structured-author E-E-A-T)"
+        # gap #4.16.3: total_score is normalized over the reachable maximum, not clamped
+        # at 100. The clamp put the top of the scale halfway up.
+        assert result.max_possible == total_max
+        assert result.raw_score == sum(m.score for m in result.methods)
+        assert result.total_score == round(100 * result.raw_score / total_max)
+        assert 0 <= result.total_score <= 100
+
+    def test_normalizzazione_non_satura_a_meta_scala(self):
+        """Una pagina con ~metà dei punti grezzi non deve risultare 'excellent'."""
+        html = "<html><body><p>Test content.</p></body></html>"
+        result = audit_citability(_soup(html), "https://example.com")
+        # Con la normalizzazione il grade deriva dalla percentuale reale, quindi
+        # raw_score/max_possible e total_score/100 esprimono la stessa frazione.
+        assert result.total_score == round(100 * result.raw_score / result.max_possible)
+        if result.raw_score < result.max_possible * 0.86:
+            assert result.grade != "excellent"
 
 
 # ============================================================================
@@ -1226,7 +1292,9 @@ class TestAuditCitability:
         result = audit_citability(_soup(html), "https://example.com")
 
         assert result.total_score > 0
-        assert result.grade in ("low", "medium", "high", "excellent")
+        # fix #26 allineò le bande a SCORE_BANDS: i grade sono questi, non low/medium/high.
+        # Il vecchio elenco passava solo perché il clamp portava ogni pagina a "excellent".
+        assert result.grade in ("critical", "foundation", "good", "excellent")
         assert len(result.methods) == 47
 
         # Verifica che ogni metodo abbia un nome
@@ -1355,6 +1423,40 @@ class TestMultiPlatform:
         result = detect_multi_platform(_soup(html))
         assert not result.detected
         assert result.score == 0
+
+    def test_instagram_tiktok_threads_sono_piattaforme(self):
+        """A `sameAs` pointing at Instagram, TikTok or Threads counts (#4.16.3).
+
+        These three were in SOCIAL_PROOF_DOMAINS but missing from
+        _PLATFORM_DOMAINS, so a brand present on them scored as if it were not.
+        """
+        html = """
+        <html><body>
+            <script type="application/ld+json">
+            {"@type": "Organization", "sameAs": [
+                "https://www.instagram.com/test",
+                "https://www.tiktok.com/@test",
+                "https://www.threads.net/@test"
+            ]}
+            </script>
+        </body></html>
+        """
+        result = detect_multi_platform(_soup(html))
+        assert result.details["platform_count"] == 3
+        assert result.details["platforms_found"] == ["Instagram", "Threads", "TikTok"]
+
+    def test_ogni_social_proof_domain_e_anche_una_piattaforma(self):
+        """SOCIAL_PROOF_DOMAINS must be a subset of _PLATFORM_DOMAINS (#4.16.3).
+
+        Not the reverse: GitHub, Medium, Reddit and Wikipedia are platforms
+        without being social proof, so the wider set is intentional. This pins
+        the direction that is a defect, which is how the three above slipped in.
+        """
+        from geo_optimizer.core.citability import _PLATFORM_DOMAINS
+        from geo_optimizer.models.config import SOCIAL_PROOF_DOMAINS
+
+        missing = sorted(set(SOCIAL_PROOF_DOMAINS) - set(_PLATFORM_DOMAINS))
+        assert not missing, f"social domains absent from _PLATFORM_DOMAINS: {missing}"
 
 
 # ============================================================================
@@ -2062,3 +2164,101 @@ class TestRetrievalTriggers:
         result = detect_retrieval_triggers(_soup(html))
         assert result.details["question_headings"] >= 2
         assert result.score >= 1
+
+
+# ============================================================================
+# TEST: @graph unpacking (gap #4.16.3)
+# ============================================================================
+
+
+_YOAST_GRAPH_HTML = """
+<html lang="en"><head>
+  <title>Acme Corp — Widgets</title>
+  <meta property="og:title" content="Acme Corp">
+  <link rel="alternate" hreflang="en" href="https://acme.com/">
+  <script type="application/ld+json">{"@context":"https://schema.org","@graph":[
+    {"@type":"Organization","name":"Acme Corp","inLanguage":"en",
+     "aggregateRating":{"@type":"AggregateRating","reviewCount":250},
+     "sameAs":["https://linkedin.com/company/acme","https://x.com/acme",
+               "https://youtube.com/@acme","https://facebook.com/acme",
+               "https://instagram.com/acme"]},
+    {"@type":"Article","headline":"H","datePublished":"2026-01-01",
+     "dateModified":"2026-01-02","author":{"@type":"Person","name":"A"},
+     "speakable":{"@type":"SpeakableSpecification","cssSelector":["h1"]}}
+  ]}</script>
+</head><body><h1>Acme Corp</h1><p>Text.</p></body></html>
+"""
+
+
+class TestGraphUnpacking:
+    """Gli schemi dentro @graph (default Yoast/RankMath) devono essere visibili.
+
+    Il fix #326 srotolava @graph in 3 punti su 12: gli altri nove detector
+    leggevano solo le chiavi top-level, quindi su un sito WordPress Organization,
+    Article e i loro sameAs risultavano assenti. Misurato su questo fixture:
+    2/17 punti prima, 9/17 dopo.
+    """
+
+    def test_entity_disambiguation_legge_name_e_sameas_nel_graph(self):
+        result = detect_entity_disambiguation(_soup(_YOAST_GRAPH_HTML))
+        assert result.details["sameas_count"] >= 5
+        assert result.detected is True
+
+    def test_multi_platform_legge_sameas_nel_graph(self):
+        result = detect_multi_platform(_soup(_YOAST_GRAPH_HTML))
+        # 5 since instagram.com joined _PLATFORM_DOMAINS; before the @graph fix
+        # this was 0, because none of the sameAs URLs were reachable at all.
+        assert result.details["platform_count"] == 5
+        assert result.detected is True
+
+    def test_blog_structure_trova_article_nel_graph(self):
+        result = detect_blog_structure(_soup(_YOAST_GRAPH_HTML))
+        assert result.details["has_article_schema"] is True
+
+    def test_social_proof_trova_aggregate_rating_nel_graph(self):
+        result = detect_social_proof(_soup(_YOAST_GRAPH_HTML))
+        assert result.details["has_aggregate_rating"] is True
+
+    def test_international_geo_trova_inlanguage_nel_graph(self):
+        result = detect_international_geo(_soup(_YOAST_GRAPH_HTML))
+        assert result.details["schema_inLanguage"] == "en"
+
+    def test_voice_search_trova_speakable_nel_graph(self):
+        result = detect_voice_search(_soup(_YOAST_GRAPH_HTML))
+        assert result.details["has_speakable_schema"] is True
+
+    def test_temporal_coherence_trova_le_date_nel_graph(self):
+        result = detect_temporal_coherence(_soup(_YOAST_GRAPH_HTML))
+        assert "schema_datePublished" in result.details["dates_found"]
+        assert "schema_dateModified" in result.details["dates_found"]
+
+    def test_graph_annidato_srotolato(self):
+        """Un @graph dentro un @graph non deve fermare la lettura."""
+        html = """<html><body><script type="application/ld+json">
+        {"@context":"https://schema.org","@graph":[
+          {"@graph":[{"@type":"Organization","name":"Nested Co",
+                      "sameAs":["https://linkedin.com/company/n","https://x.com/n"]}]}
+        ]}</script></body></html>"""
+        result = detect_entity_resolution(_soup(html))
+        assert result.details["has_sameas"] is True
+        assert "Organization" in result.details["entity_types"]
+
+    def test_json_malformato_non_interrompe_gli_altri_script(self):
+        """Uno script rotto non deve nascondere quelli validi che lo seguono."""
+        html = """<html><body>
+        <script type="application/ld+json">{ this is not json </script>
+        <script type="application/ld+json">{"@context":"https://schema.org","@graph":[
+          {"@type":"Organization","name":"Valid Co",
+           "sameAs":["https://linkedin.com/company/v","https://x.com/v"]}]}</script>
+        </body></html>"""
+        result = detect_entity_resolution(_soup(html))
+        assert result.details["has_sameas"] is True
+
+    def test_reviewcount_non_numerico_non_scarta_gli_schemi_successivi(self):
+        """Un reviewCount non numerico è dato sporco, non un motivo per fermarsi."""
+        html = """<html><body><script type="application/ld+json">{"@graph":[
+          {"@type":"Product","aggregateRating":{"reviewCount":"many"}},
+          {"@type":"Organization","aggregateRating":{"reviewCount":99}}
+        ]}</script></body></html>"""
+        result = detect_social_proof(_soup(html))
+        assert result.details["has_aggregate_rating"] is True

@@ -21,8 +21,17 @@ from geo_optimizer.web.app import (
     _check_rate_limit,
     _rate_limit_store,
     app,
+    static_dir,
 )
 
+# Some tests need the built Astro frontend (index.html). CI does not build it,
+# so skip those when the dist is missing or empty rather than asserting on bytes
+# that only exist after `npm run build`.
+_frontend_built = (static_dir / "index.html").exists()
+requires_frontend_build = pytest.mark.skipif(
+    not _frontend_built,
+    reason="Astro frontend not built (no index.html in static_dir)",
+)
 
 # ─── Fixture: AuditResult mock ───────────────────────────────────────────────
 
@@ -122,6 +131,7 @@ def client_strict():
 # ─── Test: GET / ─────────────────────────────────────────────────────────────
 
 
+@requires_frontend_build
 def test_homepage_ritorna_200_e_html(client):
     """GET / deve restituire 200 con content-type HTML."""
     response = client.get("/")
@@ -129,11 +139,32 @@ def test_homepage_ritorna_200_e_html(client):
     assert "text/html" in response.headers["content-type"]
 
 
+@requires_frontend_build
 def test_homepage_contiene_form_audit(client):
     """L'homepage deve contenere il form per l'URL di audit."""
     response = client.get("/")
-    assert b"url-input" in response.content
+    assert b"audit-url" in response.content
     assert b"GEO Optimizer" in response.content
+
+
+# ─── Test: trailing-slash redirects are 301 (SEO) ────────────────────────────
+
+
+@requires_frontend_build
+def test_trailing_slash_redirect_is_permanent(client):
+    """GET /research must 301 (not 307) to /research/ for SEO link equity."""
+    from urllib.parse import urlsplit
+
+    response = client.get("/research", follow_redirects=False)
+    assert response.status_code == 301
+    assert urlsplit(response.headers["location"]).path == "/research/"
+
+
+@requires_frontend_build
+def test_non_redirect_response_unaffected(client):
+    """A normal 200 page must not be touched by the redirect middleware."""
+    response = client.get("/research/", follow_redirects=False)
+    assert response.status_code == 200
 
 
 # ─── Test: GET /health ────────────────────────────────────────────────────────
@@ -264,7 +295,7 @@ def test_post_audit_usa_cache_per_secondo_request(client):
 
 def test_rate_limit_429_dopo_troppe_richieste(client):
     """Dopo aver superato il rate limit, deve restituire 429."""
-    from geo_optimizer.web.app import _RATE_LIMIT_MAX_REQUESTS, _RATE_LIMIT_WINDOW
+    from geo_optimizer.web.app import _RATE_LIMIT_MAX_REQUESTS
 
     mock_result = _make_mock_audit_result()
 
@@ -285,8 +316,9 @@ def test_rate_limit_429_dopo_troppe_richieste(client):
 
 def test_check_rate_limit_blocca_dopo_limite():
     """_check_rate_limit() ritorna False dopo aver superato il limite."""
-    from geo_optimizer.web.app import _RATE_LIMIT_MAX_REQUESTS, _RATE_LIMIT_WINDOW
     import time
+
+    from geo_optimizer.web.app import _RATE_LIMIT_MAX_REQUESTS
 
     test_ip = "10.0.0.99_test_rate_limit"
     now = time.time()
@@ -316,6 +348,8 @@ def test_security_headers_presenti(client):
     assert "x-content-type-options" in response.headers
     assert "x-frame-options" in response.headers
     assert "content-security-policy" in response.headers
+    assert "https://launchpadly.co" in response.headers["content-security-policy"]
+    assert "https://cdn.sanity.io" in response.headers["content-security-policy"]
 
 
 # ─── Test: _audit_result_to_dict ────────────────────────────────────────────
@@ -522,7 +556,6 @@ def test_verify_bearer_token_senza_geo_api_token_ritorna_true():
     """_verify_bearer_token ritorna True quando GEO_API_TOKEN non è configurato."""
     import geo_optimizer.web.app as app_module
     from geo_optimizer.web.app import _verify_bearer_token
-    from unittest.mock import MagicMock
 
     # Arrange: simula _API_TOKEN = None
     original = app_module._API_TOKEN
@@ -545,7 +578,6 @@ def test_verify_bearer_token_con_token_corretto_ritorna_true():
     """_verify_bearer_token ritorna True con token valido nell'header Authorization."""
     import geo_optimizer.web.app as app_module
     from geo_optimizer.web.app import _verify_bearer_token
-    from unittest.mock import MagicMock
 
     # Arrange: imposta un token di test
     original = app_module._API_TOKEN
@@ -567,7 +599,6 @@ def test_verify_bearer_token_con_token_sbagliato_ritorna_false():
     """_verify_bearer_token ritorna False con token errato."""
     import geo_optimizer.web.app as app_module
     from geo_optimizer.web.app import _verify_bearer_token
-    from unittest.mock import MagicMock
 
     # Arrange
     original = app_module._API_TOKEN
@@ -589,7 +620,6 @@ def test_verify_bearer_token_senza_header_authorization_ritorna_false():
     """_verify_bearer_token ritorna False se manca l'header Authorization."""
     import geo_optimizer.web.app as app_module
     from geo_optimizer.web.app import _verify_bearer_token
-    from unittest.mock import MagicMock
 
     # Arrange
     original = app_module._API_TOKEN
@@ -609,7 +639,6 @@ def test_verify_bearer_token_senza_header_authorization_ritorna_false():
 
 def test_post_audit_con_token_valido_restituisce_200(client):
     """POST /api/audit con GEO_API_TOKEN impostato e token corretto ritorna 200."""
-    import os
     import geo_optimizer.web.app as app_module
 
     original_token = app_module._API_TOKEN
@@ -671,7 +700,11 @@ def test_ai_faq_json_punteggi_coerenti_con_config(client):
 
     # Trova la FAQ sul calcolo del punteggio
     score_faq = next(
-        (f for f in faq_list if "score" in f.get("question", "").lower() or "calculat" in f.get("question", "").lower()),
+        (
+            f
+            for f in faq_list
+            if "score" in f.get("question", "").lower() or "calculat" in f.get("question", "").lower()
+        ),
         None,
     )
     assert score_faq is not None, "Nessuna FAQ sul calcolo del punteggio trovata"

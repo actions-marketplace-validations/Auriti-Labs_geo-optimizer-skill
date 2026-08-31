@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from html import escape
+from urllib.parse import quote
 
 from geo_optimizer.cli.scoring_helpers import (
     brand_entity_score as _brand_entity_score,
@@ -62,6 +63,12 @@ def format_audit_json(result: AuditResult) -> str:
         "timestamp": result.timestamp,
         "score": result.score,
         "band": result.band,
+        # None on a successful audit; a message (e.g. "Connection failed",
+        # "HTTP 503") when the site was unreachable — every check below is
+        # then a default-empty AuditResult, not a real "everything failed"
+        # result. A script parsing this output must check this field before
+        # trusting score/checks.
+        "error": result.error,
         "checks": {
             "robots_txt": {
                 "score": _robots_score(result),
@@ -134,6 +141,8 @@ def format_audit_json(result: AuditResult) -> str:
             "has_labeled_forms": result.webmcp.has_labeled_forms,
             "labeled_forms_count": result.webmcp.labeled_forms_count,
             "has_openapi": result.webmcp.has_openapi,
+            "has_webmcp_declaration": result.webmcp.has_webmcp_declaration,
+            "declared_tool_count": result.webmcp.declared_tool_count,
         }
 
     # Negative Signals (v4.3) — separate informational section
@@ -159,6 +168,10 @@ def format_audit_json(result: AuditResult) -> str:
     # Fix #451: JS Rendering check
     if hasattr(result, "js_rendering") and result.js_rendering and result.js_rendering.checked:
         data["js_rendering"] = asdict(result.js_rendering)
+
+    # Multimodal readiness (informational)
+    if hasattr(result, "multimodal") and result.multimodal and result.multimodal.checked:
+        data["multimodal"] = asdict(result.multimodal)
 
     # Fix #451: Trust Stack score
     if hasattr(result, "trust_stack") and result.trust_stack:
@@ -221,6 +234,13 @@ def format_audit_text(result: AuditResult) -> str:
     lines.append("  github.com/auriti-labs/geo-optimizer-skill")
     lines.append("🔍 " * 20)
     lines.append("")
+
+    if result.error:
+        lines.append(f"❌ AUDIT FAILED: {result.error}")
+        lines.append("   The site could not be reached — every check below reflects an")
+        lines.append("   empty result, not a real 0. Do not treat this as a real score.")
+        lines.append("")
+
     status_line = f"   Status: {result.http_status} | Size: {result.page_size:,} bytes"
     if result.audit_duration_ms is not None:
         status_line += f" | Duration: {result.audit_duration_ms}ms"
@@ -355,25 +375,25 @@ def format_audit_text(result: AuditResult) -> str:
         lines.append(f"  [{bar}] {be_pts}/10")
         if be.brand_name_consistent:
             names = ", ".join(be.names_found[:3]) if be.names_found else ""
-            lines.append(f"  ✅ Brand name coerente{f' ({names})' if names else ''}")
+            lines.append(f"  ✅ Brand name consistent{f' ({names})' if names else ''}")
         else:
-            lines.append("  ⚠️  Brand name incoerente tra schema, meta e contenuto")
+            lines.append("  ⚠️  Brand name inconsistent across schema, meta and content")
         if be.kg_pillar_count > 0:
             lines.append(f"  ✅ {be.kg_pillar_count}/4 Knowledge Graph pillars")
         else:
-            lines.append("  ⚠️  Nessun link a Knowledge Graph (Wikipedia, Wikidata, LinkedIn)")
+            lines.append("  ⚠️  No Knowledge Graph links (Wikipedia, Wikidata, LinkedIn)")
         if be.has_about_link:
-            lines.append("  ✅ About page collegata")
+            lines.append("  ✅ About page linked")
         else:
-            lines.append("  ⚠️  About page non rilevata")
+            lines.append("  ⚠️  About page not detected")
         if be.has_contact_info:
-            lines.append("  ✅ Informazioni di contatto presenti")
+            lines.append("  ✅ Contact information present")
         else:
-            lines.append("  ⚠️  Informazioni di contatto mancanti")
+            lines.append("  ⚠️  Contact information missing")
         if be.faq_depth > 0:
-            lines.append(f"  ✅ {be.faq_depth} FAQ trovate")
+            lines.append(f"  ✅ {be.faq_depth} FAQs found")
         if be.has_recent_articles:
-            lines.append("  ✅ Articoli con dateModified trovati")
+            lines.append("  ✅ Articles with dateModified found")
 
     # CDN Check
     if result.cdn_check and result.cdn_check.checked:
@@ -447,13 +467,21 @@ def format_audit_text(result: AuditResult) -> str:
         lines.append(f"  Chunk readiness: {rc.chunk_readiness_score}/100")
 
     # Embedding Proximity (#354)
+    # Printed even when skipped (#509): the check needs the optional
+    # sentence-transformers extra, and silently omitting the section left a hole in
+    # the numbering — 13 followed by 15 — which reads as a bug rather than as a
+    # missing optional dependency. The reason is already recorded upstream in
+    # audit_embedding.py; this only surfaces it.
     ep = getattr(result, "embedding_proximity", None)
-    if ep and ep.checked and not ep.skipped_reason:
+    if ep and ep.checked:
         lines.append("")
         lines.append(_section_header("14. EMBEDDING PROXIMITY"))
-        lines.append(f"  Model: {ep.model_name}")
-        lines.append(f"  Avg similarity: {ep.avg_similarity:.4f} | Top: {ep.top_similarity:.4f}")
-        lines.append(f"  Retrievable chunks: {ep.retrievable_chunks}/{ep.total_chunks}")
+        if ep.skipped_reason:
+            lines.append(f"  ⏭️  Skipped: {ep.skipped_reason}")
+        else:
+            lines.append(f"  Model: {ep.model_name}")
+            lines.append(f"  Avg similarity: {ep.avg_similarity:.4f} | Top: {ep.top_similarity:.4f}")
+            lines.append(f"  Retrievable chunks: {ep.retrievable_chunks}/{ep.total_chunks}")
 
     # Content Decay Predictor (#383)
     cd = getattr(result, "content_decay", None)
@@ -507,6 +535,28 @@ def format_audit_text(result: AuditResult) -> str:
         )
         lines.append(f"  Readiness: {ir.readiness_score}/100 ({ir.readiness_level})")
 
+    # Multimodal readiness (informational)
+    mm = getattr(result, "multimodal", None)
+    if mm and mm.checked and mm.readiness_level != "none":
+        lines.append("")
+        lines.append(_section_header("19. MULTIMODAL READINESS"))
+        if mm.total_images:
+            lines.append(
+                f"  Images: {mm.images_with_alt}/{mm.total_images} with descriptive alt "
+                f"({mm.alt_coverage:.0%}) | captions: {mm.caption_count}"
+            )
+        if mm.has_video:
+            lines.append(
+                f"  Video: {mm.video_count} found | VideoObject schema: {'✅' if mm.has_video_schema else '❌'} "
+                f"| captions/transcript: {'✅' if (mm.has_video_captions or mm.has_transcript) else '❌'}"
+            )
+        if mm.has_audio:
+            lines.append(
+                f"  Audio: present | schema: {'✅' if mm.has_audio_schema else '❌'} "
+                f"| transcript: {'✅' if mm.has_transcript else '❌'}"
+            )
+        lines.append(f"  Readiness: {mm.readiness_level}")
+
     # Score
     lines.append("")
     lines.append(_section_header("📊 FINAL GEO SCORE"))
@@ -536,6 +586,20 @@ def format_audit_text(result: AuditResult) -> str:
         for i, action in enumerate(result.recommendations, 1):
             lines.append(f"  {i}. {action}")
 
+    # CLI→platform funnel: the CLI is one-shot, continuity lives in the platform
+    lines.append("")
+    lines.append("  💡 One-shot audit. The free plan at https://geoready.dev tracks 1 domain")
+    lines.append("     with a weekly drift email — plus score history and AI citation tracking.")
+
+    # Badge growth loop: only suggest embedding a score worth showing off (gap #501)
+    if result.band in ("excellent", "good"):
+        lines.append("")
+        lines.append(f"  🏅 {result.score}/100 is embed-worthy. Add it to your README:")
+        lines.append(
+            f"     [![GEO Score](https://geoready.dev/badge?url={quote(result.url, safe='')})]"
+            "(https://geoready.dev?utm_source=badge)"
+        )
+
     lines.append("")
     return "\n".join(lines)
 
@@ -558,6 +622,9 @@ def format_batch_audit_json(result: BatchAuditResult) -> str:
         "worst_pages": [asdict(page) for page in result.worst_pages],
         "pages": [asdict(page) for page in result.pages],
     }
+    # gap #6: include truncation warning when present
+    if result.truncated_warning:
+        data["truncated_warning"] = result.truncated_warning
     return json.dumps(data, indent=2)
 
 
@@ -578,6 +645,9 @@ def format_batch_audit_text(result: BatchAuditResult) -> str:
         f"Success: {result.successful_urls} | "
         f"Failed: {result.failed_urls}"
     )
+    # gap #6: show truncation warning in text output
+    if result.truncated_warning:
+        lines.append(f"   WARNING: {result.truncated_warning}")
     lines.append(f"   Average score: {result.average_score:.2f}/100 ({result.average_band.upper()})")
 
     lines.append("")
@@ -859,6 +929,13 @@ def format_monitor_text(result: MonitorResult) -> str:
     lines.append("  github.com/auriti-labs/geo-optimizer-skill")
     lines.append("🔍 " * 20)
     lines.append("")
+
+    if result.error:
+        lines.append(f"❌ AUDIT FAILED: {result.error}")
+        lines.append("   The site could not be reached — every signal below reflects an")
+        lines.append("   empty result, not real visibility data. Do not treat this as real.")
+        lines.append("")
+
     lines.append(f"   Domain: {result.domain}")
     lines.append(f"   Homepage: {result.url}")
     lines.append(f"   Visibility score: {result.visibility_score}/100 ({result.band.upper()}) | Mode: {result.mode}")

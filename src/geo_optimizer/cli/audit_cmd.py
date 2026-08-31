@@ -21,8 +21,12 @@ from geo_optimizer.cli.formatters import (
 from geo_optimizer.core.audit import run_full_audit
 from geo_optimizer.core.batch_audit import run_batch_audit
 from geo_optimizer.core.history import HistoryStore, summarize_history
-from geo_optimizer.models.config import DEFAULT_HISTORY_RETENTION_DAYS
-from geo_optimizer.utils.validators import validate_public_url
+from geo_optimizer.models.config import (
+    DEFAULT_HISTORY_RETENTION_DAYS,
+    resolve_user_agent_override,
+    set_user_agent_override,
+)
+from geo_optimizer.utils.validators import normalize_url_scheme, validate_public_url
 
 
 @click.command()
@@ -50,16 +54,22 @@ from geo_optimizer.utils.validators import validate_public_url
 @click.option(
     "--retention-days",
     default=DEFAULT_HISTORY_RETENTION_DAYS,
-    type=int,
+    type=click.IntRange(1),
     show_default=True,
-    help="Retention window for local history snapshots",
+    help="Retention window for local history snapshots (minimum 1 day)",
 )
 @click.option("--history-db", default=None, hidden=True, help="Override local tracking DB path")
 @click.option(
     "--threshold",
     default=None,
-    type=int,
+    type=click.IntRange(0, 100),
     help="Minimum score threshold (0-100). Exit code 1 if score is below.",
+)
+@click.option(
+    "--user-agent",
+    default=None,
+    help="Override the User-Agent sent when fetching the site (also via GEO_USER_AGENT). "
+    "Does not affect the CDN AI-crawler check, which needs its own bot identity.",
 )
 def audit(
     url,
@@ -78,8 +88,11 @@ def audit(
     retention_days,
     history_db,
     threshold,
+    user_agent,
 ):
     """Audit a website's GEO (Generative Engine Optimization) readiness."""
+    set_user_agent_override(resolve_user_agent_override(user_agent))
+
     # Load project configuration (if available)
     from geo_optimizer.models.project_config import load_config
 
@@ -139,11 +152,14 @@ def audit(
         raise click.UsageError("Batch audit via '--sitemap' supports only '--format text' or '--format json'")
 
     target_url = sitemap or url
-    safe, reason = validate_public_url(
-        target_url if target_url.startswith(("http://", "https://")) else f"https://{target_url}"
-    )
+    safe, reason = validate_public_url(normalize_url_scheme(target_url))
     if not safe:
-        click.echo(f"\n❌ Unsafe URL: {reason}", err=True)
+        hint = (
+            " Please use a public URL (e.g., https://example.com)."
+            if "Host not allowed" in reason or "localhost" in reason or "non-public" in reason
+            else ""
+        )
+        click.echo(f"\n❌ Unsafe URL: {reason}{hint}", err=True)
         sys.exit(1)
 
     try:
@@ -218,7 +234,12 @@ def audit(
 
     history_result = None
     history_entry = None
-    persist_history = bool(url and (save_history or regression))
+    # A transient network blip must not corrupt the trend history with a
+    # fake 0/100 "critical" snapshot: --regression would then report a false
+    # positive against real content (comparing against a fabricated
+    # baseline), and any later real regression would be masked as an
+    # "improvement" relative to that same fabricated 0.
+    persist_history = bool(url and (save_history or regression) and not getattr(result, "error", None))
     if persist_history:
         store = HistoryStore(Path(history_db) if history_db else None)
         history_entry = store.save_audit_result(result, retention_days=retention_days)

@@ -2,7 +2,7 @@
 # Esegue un audit GEO completo su qualsiasi URL direttamente nella CI/CD pipeline.
 #
 # Utilizzo:
-#   - uses: Auriti-Labs/geo-optimizer-skill@v1
+#   - uses: Auriti-Labs/geo-optimizer-skill@v4.14.0
 #     with:
 #       url: https://mysite.com
 #       min-score: 70
@@ -57,7 +57,7 @@ runs:
   steps:
     # 1. Setup Python
     - name: Setup Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: "3.12"
 

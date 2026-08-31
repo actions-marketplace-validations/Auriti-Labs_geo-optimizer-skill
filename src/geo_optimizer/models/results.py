@@ -40,6 +40,8 @@ class RobotsResult:
     # Partially blocked bots (Disallow: / + specific Allows — #106)
     bots_partial: list[str] = field(default_factory=list)
     citation_bots_ok: bool = False
+    # gap #8: Crawl-delay directive value for the wildcard (*) agent, in seconds
+    crawl_delay: float | None = None
     # True if citation bots are explicitly allowed (not just via wildcard — #111)
     citation_bots_explicit: bool = False
 
@@ -64,6 +66,29 @@ class LlmsTxtResult:
     has_optional_section: bool = False  # ## Optional section present
     companion_files_hint: bool = False  # link to companion .md files
     validation_warnings: list[str] = field(default_factory=list)  # conformance warnings
+
+
+@dataclass
+class LlmsDriftResult:
+    """Compares an llms.txt's listed URLs against the site's current sitemap.
+
+    llms.txt is generated once and then trusted by AI agents as a map of the
+    site — nothing previously checked whether that map still matches reality.
+    `stale_urls` (listed in llms.txt, absent from the current sitemap) is the
+    signal that actively hurts citability: an agent following those links
+    hits 404s or redirects instead of the content it was told to expect.
+    `missing_urls` (in the sitemap, not yet in llms.txt) means llms.txt is
+    just behind, not wrong.
+    """
+
+    checked: bool = False
+    llms_txt_url_count: int = 0
+    sitemap_url_count: int = 0
+    stale_urls: list[str] = field(default_factory=list)  # in llms.txt, gone from the sitemap
+    stale_url_count: int = 0
+    missing_urls: list[str] = field(default_factory=list)  # in the sitemap, not yet in llms.txt (sample)
+    missing_url_count: int = 0
+    error: str | None = None
 
 
 # ─── Schema JSON-LD ──────────────────────────────────────────────────────────
@@ -92,6 +117,9 @@ class SchemaResult:
     ecommerce_signals: dict = field(default_factory=dict)
     # Fix #399: conteggio errori di parsing JSON-LD
     json_parse_errors: int = 0
+    # Schema completeness: types found but missing required fields (gap #3)
+    schema_missing_fields: dict = field(default_factory=dict)
+    incomplete_schema_types: list = field(default_factory=list)
 
 
 # ─── Meta tags ───────────────────────────────────────────────────────────────
@@ -110,6 +138,12 @@ class MetaResult:
     description_length: int = 0
     title_length: int = 0
     canonical_url: str = ""
+    # X-Robots-Tag HTTP header (gap #2 — blocks AI indexing even when robots.txt allows)
+    x_robots_noindex: bool = False
+    x_robots_tag: str = ""
+    # noai / noimageai in meta[name="robots"] (gap #7 — blocks AI training data use)
+    has_noai: bool = False
+    noai_value: str = ""
 
 
 # ─── Content quality ─────────────────────────────────────────────────────────
@@ -155,6 +189,7 @@ class BrandEntityResult:
     # Entity Coherence (3 points)
     brand_name_consistent: bool = False
     names_found: list[str] = field(default_factory=list)
+    primary_name: str | None = None  # best single candidate: schema Organization name, else most-frequent
     schema_desc_matches_meta: bool = False
 
     # Knowledge Graph Readiness (3 points)
@@ -203,6 +238,10 @@ class CitabilityResult:
     total_score: int = 0  # 0-100 (normalized sum)
     grade: str = "low"  # low/medium/high/excellent
     top_improvements: list[str] = field(default_factory=list)
+    # gap #4.16.3: raw points and the reachable maximum behind total_score, so the
+    # normalized value stays auditable instead of being an opaque 0-100 figure.
+    raw_score: int = 0
+    max_possible: int = 0
 
 
 # ─── AI Discovery (geo-checklist.dev) ────────────────────────────────────────
@@ -219,6 +258,8 @@ class AiDiscoveryResult:
     summary_valid: bool = False  # ha i campi richiesti (name + description)
     faq_count: int = 0  # number of FAQs found
     endpoints_found: int = 0  # total count of endpoints found (0-4)
+    has_webmcp_declaration: bool = False  # /ai/summary.json declares a "webmcp" block (#535)
+    webmcp_declared_tool_count: int = 0  # tool names listed in that declaration, if any
 
 
 # ─── CDN AI Crawler Check (#225) ─────────────────────────────────────────────
@@ -228,7 +269,8 @@ class AiDiscoveryResult:
 class CdnAiCrawlerResult:
     """Result of checking if CDN blocks AI crawler user-agents.
 
-    Simulates requests as AI bots (GPTBot, ClaudeBot, PerplexityBot) and
+    Simulates requests as the AI bots that drive citations (GPTBot,
+    OAI-SearchBot, PerplexityBot, Claude-SearchBot, Googlebot, Applebot) and
     compares status codes + content-length to a normal browser request.
     """
 
@@ -269,6 +311,29 @@ class JsRenderingResult:
 
 
 @dataclass
+class MultimodalResult:
+    """Multimodal readiness — image/video/audio text scaffolding for multimodal AI engines.
+
+    Informational bonus check: multimodal engines (Gemini, GPT-4o) reach
+    non-text content through alt text, captions, schema, and transcripts.
+    """
+
+    checked: bool = False
+    total_images: int = 0
+    images_with_alt: int = 0  # images with informative alt (>= 5 chars)
+    alt_coverage: float = 0.0  # 0-1
+    caption_count: int = 0  # <figcaption> elements
+    has_video: bool = False  # <video> or embedded player iframe
+    video_count: int = 0
+    has_video_schema: bool = False  # VideoObject/Clip/BroadcastEvent JSON-LD
+    has_video_captions: bool = False  # <track kind="captions|subtitles">
+    has_audio: bool = False
+    has_audio_schema: bool = False  # AudioObject/PodcastEpisode JSON-LD
+    has_transcript: bool = False  # transcript keyword or schema property
+    readiness_level: str = "none"  # none | missing | basic | good | excellent
+
+
+@dataclass
 class WebMcpResult:
     """Checks whether the site is ready for AI agents via WebMCP and related signals."""
 
@@ -278,6 +343,12 @@ class WebMcpResult:
     has_register_tool: bool = False  # navigator.modelContext.registerTool()
     has_tool_attributes: bool = False  # HTML attributes toolname/tooldescription
     tool_count: int = 0  # number of declared tools
+    has_webmcp_declaration: bool = False  # webmcp block in /ai/summary.json (#535) — the
+    # detectors above only see raw HTML, so registerTool() calls made by an
+    # external bundled JS module (any bundler: Astro, Vite, Next, SvelteKit)
+    # are invisible without executing JS. A published discovery document is
+    # a partial, zero-extra-fetch substitute credited toward readiness.
+    declared_tool_count: int = 0
 
     # Agent-readiness signals
     has_potential_action: bool = False  # schema potentialAction (SearchAction, etc.)
@@ -682,6 +753,74 @@ class CitationMapResult:
     overall_visibility: float = 0.0  # 0-1
 
 
+# ─── Topic Authority (geo authority) ─────────────────────────────────────────
+
+
+@dataclass
+class TopicCluster:
+    """A group of pages covering the same topic (entity-based authority)."""
+
+    topic: str = ""
+    pages: list[str] = field(default_factory=list)
+    pages_count: int = 0
+    pillar_url: str = ""  # page whose title/H1 states the topic ("" if missing)
+    interlink_ratio: float = 0.0  # share of cluster pages linking to another cluster page
+
+
+@dataclass
+class TopicAuthorityResult:
+    """Site-level topical authority analysis (`geo authority`).
+
+    AI engines map entities and multi-page topic coverage, not single pages:
+    a brand with several interlinked pages covering a topic from multiple
+    angles is more visible than a brand with one strong page.
+    """
+
+    checked: bool = False
+    skipped_reason: str | None = None
+    pages_analyzed: int = 0
+    clusters: list[TopicCluster] = field(default_factory=list)
+    authority_score: int = 0  # 0-100
+    recommendations: list[str] = field(default_factory=list)
+    # #512: pages with zero inbound internal links from the other analyzed
+    # pages — crawlers relying on link-following (not just the sitemap) may
+    # never reach them, and they carry weak entity association either way.
+    orphan_pages: list[str] = field(default_factory=list)
+
+
+# ─── AI Citation Check (geo citations) ───────────────────────────────────────
+
+
+@dataclass
+class CitationCheckEntry:
+    """A single query result in the one-shot AI citation check."""
+
+    query: str = ""
+    platform: str = ""
+    model: str = ""
+    brand_mentioned: bool = False
+    domain_cited: bool = False
+    cited_sources: list[str] = field(default_factory=list)  # source URLs from the answer
+    snippet: str = ""
+    error: str | None = None
+
+
+@dataclass
+class CitationCheckResult:
+    """Aggregated result of `geo citations` — is the brand/domain cited by AI engines?"""
+
+    checked: bool = False
+    skipped_reason: str | None = None
+    brand: str = ""
+    domain: str = ""
+    entries: list[CitationCheckEntry] = field(default_factory=list)
+    queries_run: int = 0
+    brand_mention_rate: float = 0.0  # 0-1, share of answers mentioning the brand
+    domain_citation_rate: float = 0.0  # 0-1, share of answers citing the domain as a source
+    top_cited_domains: list[tuple[str, int]] = field(default_factory=list)  # (domain, count), own domain excluded
+    verdict: str = ""  # strong | cited | mentioned_only | invisible
+
+
 # ─── Prompt Library (v4.7) ───────────────────────────────────────────────────
 
 
@@ -757,6 +896,68 @@ class InstructionReadinessResult:
     readiness_level: str = "none"  # none | basic | ready | advanced
 
 
+# ─── AI Search Intent Mapping (v4.10) ─────────────────────────────────────────
+
+
+@dataclass
+class IntentMappingResult:
+    """AI search intent mapping analysis (#385). Informational — does not affect GEO score."""
+
+    checked: bool = False
+    # Intents detected from page content (informational, navigational, transactional, commercial)
+    intents_found: list[str] = field(default_factory=list)
+    intents_missing: list[str] = field(default_factory=list)
+    # Detailed mapping per category
+    intent_details: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Coverage score: 0-100 average across detected intent categories
+    score: int = 0
+    band: str = "critical"  # excellent | good | foundation | critical
+    # How many of the detected intents have supporting schema markup
+    ai_ready_count: int = 0
+    ai_unready_count: int = 0
+    total_intents_found: int = 0
+    total_intents_missing: int = 0
+    # v4.10: gap analysis + radar + recommendations
+    primary_intent: str = ""  # strongest intent category
+    gap_summary: str = ""  # human-readable one-liner
+    recommendations: list[str] = field(default_factory=list)  # actionable fixes
+    radar_data: list[dict[str, Any]] = field(default_factory=list)  # [{axis, value}, ...]
+    # Prompt library alignment (#385)
+    prompt_library_intents: dict[str, str] = field(default_factory=dict)  # {prompt_category: standard_intent}
+
+
+# ─── Hallucination Bait Detection (v4.10) ────────────────────────────────────
+
+
+@dataclass
+class HallucinationBaitResult:
+    """Hallucination bait pattern detection (#377). Informational — does not affect GEO score."""
+
+    checked: bool = False
+    total_baits: int = 0
+    severity: str = "clean"  # clean | low | medium | high
+    # Per-category counts
+    unsourced_stats: int = 0
+    absolute_claims: int = 0
+    speculative_statements: int = 0
+    vague_ranges: int = 0
+    ai_generated_signals: int = 0
+    self_citations: int = 0
+    missing_units: int = 0
+    medical_claims: int = 0
+    # Samples (max 3 per category)
+    unsourced_stats_samples: list[str] = field(default_factory=list)
+    absolute_claims_samples: list[str] = field(default_factory=list)
+    speculative_samples: list[str] = field(default_factory=list)
+    vague_range_samples: list[str] = field(default_factory=list)
+    ai_generated_samples: list[str] = field(default_factory=list)
+    self_citation_samples: list[str] = field(default_factory=list)
+    missing_units_samples: list[str] = field(default_factory=list)
+    medical_claim_samples: list[str] = field(default_factory=list)
+    # Human-readable detail strings
+    details: list[str] = field(default_factory=list)
+
+
 # ─── Full audit ──────────────────────────────────────────────────────────────
 
 
@@ -794,6 +995,8 @@ class AuditResult:
     brand_entity: BrandEntityResult = field(default_factory=BrandEntityResult)
     # v4.3: WebMCP Readiness check (#233)
     webmcp: WebMcpResult = field(default_factory=WebMcpResult)
+    # Multimodal readiness — image/video/audio scaffolding (informational)
+    multimodal: MultimodalResult = field(default_factory=MultimodalResult)
     # v4.3: Negative Signals detection
     negative_signals: NegativeSignalsResult = field(default_factory=NegativeSignalsResult)
     # v4.4: Prompt Injection Pattern Detection (#276)
@@ -816,6 +1019,10 @@ class AuditResult:
     context_window: ContextWindowResult = field(default_factory=ContextWindowResult)
     # v4.9: Instruction following readiness (#371)
     instruction_readiness: InstructionReadinessResult = field(default_factory=InstructionReadinessResult)
+    # v4.10: AI Search Intent Mapping (#385)
+    intent_mapping: IntentMappingResult = field(default_factory=IntentMappingResult)
+    # v4.10: Hallucination Bait Detection (#377)
+    hallucination_bait: HallucinationBaitResult = field(default_factory=HallucinationBaitResult)
 
 
 # ─── Batch audit ─────────────────────────────────────────────────────────────
@@ -851,6 +1058,8 @@ class BatchAuditResult:
     pages: list[BatchAuditPageResult] = field(default_factory=list)
     top_pages: list[BatchAuditPageResult] = field(default_factory=list)
     worst_pages: list[BatchAuditPageResult] = field(default_factory=list)
+    # gap #6: warning when sitemap has more URLs than max_urls cap
+    truncated_warning: str = ""
 
 
 # ─── Audit diff ──────────────────────────────────────────────────────────────
@@ -975,6 +1184,10 @@ class MonitorResult:
     latest_geo_band: str | None = None
     signals: list[MonitorSignal] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
+    # None on a successful audit; the underlying AuditResult.error when the
+    # site was unreachable — every signal/score above is then computed from
+    # a default-empty audit, not a real "no visibility" result.
+    error: str | None = None
 
 
 # ─── Answer snapshots ───────────────────────────────────────────────────────
@@ -1105,6 +1318,8 @@ class SitemapUrl:
     lastmod: str | None = None
     priority: float = 0.5
     title: str | None = None
+    # gap #11: changefreq from sitemap XML (always/daily/weekly/monthly/yearly/never)
+    changefreq: str | None = None
 
 
 # ─── Fix plan ───────────────────────────────────────────────────────────────
@@ -1130,3 +1345,95 @@ class FixPlan:
     score_estimated_after: int = 0
     fixes: list[FixItem] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+
+
+# ─── Agent Access ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class AgentAccessResult:
+    """Unified result for agent access audit (geo access command).
+
+    Aggregates robots, CDN, JS rendering, noai meta, and AI discovery checks
+    into a single actionable result.
+    Status values: 'accessible' | 'partial' | 'blocked' | 'unknown'
+    """
+
+    url: str = ""
+    overall_status: str = "unknown"
+    robots_allows_citation_bots: bool = False
+    robots_blocks: list[str] = field(default_factory=list)
+    cdn_challenge_detected: bool = False
+    js_required: bool = False
+    noai_meta_present: bool = False
+    x_robots_noai: bool = False
+    x_robots_noindex: bool = False
+    ai_discovery_score: int = 0
+    # #512: Time-to-first-byte in ms and raw HTML weight in bytes — access-layer
+    # signals a non-rendering AI crawler is sensitive to (slow/heavy pages get
+    # less crawl depth and frequency; 0 means not measured, e.g. fetch failed).
+    ttfb_ms: float = 0.0
+    page_weight_bytes: int = 0
+    blocking_issues: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    passing: list[str] = field(default_factory=list)
+
+
+# ─── Semantic Drift ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class SemanticDriftDelta:
+    """Delta between two GEO audit snapshots for drift detection.
+
+    Severity values: 'critical' | 'warning' | 'info' | 'none'
+    """
+
+    entity_changed: bool = False
+    entity_before: str | None = None
+    entity_after: str | None = None
+    schema_types_removed: list[str] = field(default_factory=list)
+    score_delta: int = 0
+    category_deltas: dict[str, int] = field(default_factory=dict)
+    topic_changed: bool = False
+    canonical_changed: bool = False
+    crawlable_before: bool = True
+    crawlable_after: bool = True
+    blocking_issues_hint: str = ""
+    severity: str = "none"
+    detected_at: str = ""
+
+
+# ─── AI Perception ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class PerceptionSnapshot:
+    """Deterministic AI perception extraction from an AuditResult.
+
+    Represents what an AI/retrieval system would likely extract from the page.
+    Always includes a disclaimer: this is simulated, not real AI output.
+
+    mode values: 'deterministic' | 'llm'
+    """
+
+    url: str = ""
+    mode: str = "deterministic"
+    brand_name: str | None = None
+    brand_entity_type: str | None = None
+    main_topic: str | None = None
+    detected_services: list[str] = field(default_factory=list)
+    detected_audience: str | None = None
+    evidence_snippets: list[dict] = field(default_factory=list)
+    supported_claims: list[str] = field(default_factory=list)
+    unsupported_claims: list[str] = field(default_factory=list)
+    citation_worthy_facts: list[str] = field(default_factory=list)
+    ambiguities: list[str] = field(default_factory=list)
+    missing_authority_signals: list[str] = field(default_factory=list)
+    ai_readable_summary: str | None = None
+    schema_types_present: list[str] = field(default_factory=list)
+    trust_score: float | None = None
+    trust_max: float | None = None  # trust_score is on this scale, not 0-100 (#perception)
+    trust_grade: str | None = None
+    citability_grade: str | None = None
+    disclaimer: str = "Simulated AI perception based on deterministic analysis. Not a real AI system output."

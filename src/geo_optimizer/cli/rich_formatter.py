@@ -276,7 +276,7 @@ def _build_robots_card(result: AuditResult, score: int, max_score: int) -> Panel
     content_parts.append(Text())
 
     if not result.robots.found:
-        content_parts.append(Text("  File non trovato", style=f"italic {_COLORS['dim']}"))
+        content_parts.append(Text("  File not found", style=f"italic {_COLORS['dim']}"))
     else:
         # Bot info with detail
         info = Text()
@@ -327,7 +327,7 @@ def _build_llms_card(result: AuditResult, score: int, max_score: int) -> Panel:
     content_parts.append(Text())
 
     if not result.llms.found:
-        content_parts.append(Text("  File non trovato", style=f"italic {_COLORS['dim']}"))
+        content_parts.append(Text("  File not found", style=f"italic {_COLORS['dim']}"))
     else:
         # Structure details
         features = []
@@ -391,7 +391,7 @@ def _build_schema_card(result: AuditResult, score: int, max_score: int) -> Panel
     content_parts.append(Text())
 
     if not result.schema.found_types:
-        content_parts.append(Text("  Nessuno schema trovato", style=f"italic {_COLORS['dim']}"))
+        content_parts.append(Text("  No schema found", style=f"italic {_COLORS['dim']}"))
     else:
         # Schemas found as inline tags
         types_text = Text("  ")
@@ -674,9 +674,9 @@ def _build_brand_entity_card(result: AuditResult, score: int, max_score: int) ->
     # Brand name consistency
     coherence = Text("  ")
     if be.brand_name_consistent:
-        coherence.append("✓ Brand name coerente", style=_COLORS["excellent"])
+        coherence.append("✓ Brand name consistent", style=_COLORS["excellent"])
     else:
-        coherence.append("✗ Brand name incoerente", style=_COLORS["critical"])
+        coherence.append("✗ Brand name inconsistent", style=_COLORS["critical"])
     if be.names_found:
         coherence.append(f"  ({', '.join(be.names_found[:3])})", style=_COLORS["dim"])
     content_parts.append(coherence)
@@ -814,9 +814,9 @@ def _build_js_card(result: AuditResult) -> Panel | None:
         content_parts.append(fw)
 
     if js.has_empty_root:
-        content_parts.append(Text("  ⚠ Container SPA vuoto rilevato", style=_COLORS["foundation"]))
+        content_parts.append(Text("  ⚠ Empty SPA container detected", style=_COLORS["foundation"]))
     if js.has_noscript_content:
-        content_parts.append(Text("  ℹ Fallback <noscript> presente", style=_COLORS["dim"]))
+        content_parts.append(Text("  ℹ Fallback <noscript> present", style=_COLORS["dim"]))
 
     color = _COLORS["excellent"] if not js.js_dependent else _COLORS["critical"]
     status = "PASS" if not js.js_dependent else "JS-DEPENDENT"
@@ -872,6 +872,7 @@ def _build_webmcp_card(result: AuditResult) -> Panel | None:
     webmcp_items = [
         ("registerTool() API", wm.has_register_tool),
         ("toolname attributes", wm.has_tool_attributes),
+        ("Declared in ai/summary.json", wm.has_webmcp_declaration),
     ]
     for label, present in webmcp_items:
         line = Text("  ")
@@ -879,6 +880,8 @@ def _build_webmcp_card(result: AuditResult) -> Panel | None:
             line.append(f"✓ {label}", style=_COLORS["excellent"])
             if label == "toolname attributes" and wm.tool_count:
                 line.append(f" ({wm.tool_count})", style=_COLORS["dim"])
+            elif label == "Declared in ai/summary.json" and wm.declared_tool_count:
+                line.append(f" ({wm.declared_tool_count})", style=_COLORS["dim"])
         else:
             line.append(f"✗ {label}", style=_COLORS["dim"])
         content_parts.append(line)
@@ -1211,6 +1214,23 @@ def format_audit_rich(result: AuditResult) -> str:
     motiv = motiv_messages.get(result.band, "")
     if motiv:
         console.print(Align.center(Text(motiv, style=f"italic {_COLORS['dim']}")))
+
+    # CLI→platform funnel: the CLI is one-shot, continuity lives in the platform
+    console.print()
+    funnel = Text()
+    funnel.append("Free plan: 1 monitored domain + weekly drift email → ", style=_COLORS["dim"])
+    funnel.append("geoready.dev", style=f"bold {_COLORS['brand_1']} underline")
+    console.print(Align.center(funnel))
+
+    # Badge growth loop: only suggest embedding a score worth showing off (gap #501)
+    if result.band in ("excellent", "good"):
+        console.print()
+        badge = Text()
+        badge.append(
+            f"🏅 {result.score}/100 is embed-worthy — add a live badge to your README → ", style=_COLORS["dim"]
+        )
+        badge.append("geoready.dev/badge", style=f"bold {_COLORS['brand_1']} underline")
+        console.print(Align.center(badge))
 
     console.print()
     return buf.getvalue()

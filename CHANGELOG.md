@@ -5,11 +5,307 @@ Format: [Keep a Changelog](https://keepachangelog.com/) · [SemVer](https://semv
 
 ---
 
-## [Unreleased]
+## [4.17.1] — 2026-08-31
 
-Next planned release: **v4.10.0** (Veil) — Late May / Early June 2026.
+Patch release from a dogfooding sweep against this project's own production
+infrastructure (geoready.dev, live audits, a hosted API endpoint): a batch of
+"confident wrong answer" bugs found and fixed the same way most of this
+project's patches have been — running the tool against real sites and reading
+the output critically — plus three small, additive capabilities that came out
+of the same review pass (schema templates, an llms.txt freshness check,
+a stronger E-E-A-T signal).
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full release calendar and project direction.
+### Added
+- **E-E-A-T scoring credits a structured, verifiable author.** `detect_eeat` previously only looked for a text bio matching "N years of experience" — prose anyone can write regardless of whether it's true. It now also checks whether the page's Article-type schema has an `author` that is a `Person` object (not a bare string), crediting it further when that `Person` carries `sameAs` links to a checkable profile (LinkedIn, ORCID, a personal site) — a claim an AI system can actually verify, unlike a bio. `eeat_signals` max score moves from 5 to 7; total citability `max_possible` moves from 208 to 210 accordingly (same normalization as always — nothing is clamped, the ceiling just moved because a real signal was added).
+- **Published a real score-stability measurement on the methodology page.** Determinism was previously only asserted qualitatively ("the score is reproducible"). Re-measured against 2,513 real back-to-back audit pairs (216 domains, ≤48h apart, hosted production data — cache hits are excluded by design so every pair reflects an independent computation): 98.6% of pairs move by exactly zero points, average movement 0.09 points, 99.4% within 3 points. Dated on the page (2026-08-30) so it doesn't silently go stale.
+- **`geo schema --type` can generate HowTo, Review and Product.** `audit_schema.py` already scores `has_howto`/`has_product`, and Review/AggregateRating is one of the more citation-relevant schema types per GEO research — but there was no way to ask the tool that flags these as missing to actually generate them; a user had to hand-write the JSON-LD. Three new templates close that gap: `howto` (with a `HowToStep` array), `review` (`Review` with a nested `Rating`, not a bare number), and `product` (with a nested `Offer`).
+- **`geo llms --check-drift` catches a stale llms.txt.** llms.txt is generated once and then trusted by AI agents as a map of the site; nothing previously checked whether that map still matched reality. The new flag compares llms.txt's listed URLs against the site's *current* sitemap — reusing the sitemap fetch `geo llms` already does for generation, so it costs no extra per-link HTTP request and stays deterministic rather than flaky. Reports **stale** URLs (listed in llms.txt, gone from the sitemap — actively hurts citability, an agent following the link hits a 404) separately from **missing** ones (in the sitemap, not yet in llms.txt — just behind). Exits 1 on stale URLs, so it's CI-gateable like `geo audit --min-score`.
+
+### Fixed
+- **A URL typed with an uppercase scheme silently became unreachable.** 15 call sites across the codebase each inlined a case-sensitive `if not url.startswith(("http://", "https://"))` before fetching. `HTTP://example.com` already has a scheme but fails that check, so it got a second one prepended — `https://HTTP://example.com` — which `urlparse` reads as netloc `HTTP:` with the real host lost in the path. The URL then failed DNS resolution with an error blaming the domain, not the parsing. Reproduced live: `geo audit --url HTTP://geoready.dev` failed with "DNS resolution failed" against a domain that resolves fine; same command now returns the same score as the lowercase URL. Consolidated into one shared, case-insensitive `normalize_url_scheme()` (`utils/validators.py`) — `urlparse` itself already lowercases the scheme it parses, so validation was never the problem, only the ad-hoc pre-check duplicated 15 times, inconsistently, before it.
+- **`geo perception` picked the publisher's name over the page's own subject.** `audit_brand_entity` treated schema `Organization` as the sole authoritative name source, unconditionally outranking every other signal — including `WebSite`/`WebApplication`/`SoftwareApplication` schema, which is equally structured data but was bucketed with the *less* trusted positional guesses (H1/title/og:title). Reproduced live on this project's own geoready.dev homepage: `WebSite` and `WebApplication` schema both say "GeoReady" (the product, what the page is about), `Organization` schema says "Auriti Labs" (the company that publishes it) — the tool reported the brand as "Auriti Labs". `WebSite`/`WebApplication`/`SoftwareApplication` names now outrank `Organization` when they disagree; `Organization` still outranks positional guesses when it's the only structured signal present (the original fix this built on, still correct on its own terms).
+- **More leftover Italian strings in English-only output (follow-up to #509).** 8 more hardcoded Italian strings, found by scanning every `click.echo`/`Text()`/warning call across the CLI and formatters: unsafe-URL and invalid-file-path errors in `geo llms`/`geo schema`, "File not found" in the rich formatter's robots.txt/llms.txt sections (shown to every English user auditing a site missing either file), an "empty SPA container" / "noscript fallback" notice in the JS-rendering card, and two citability freshness warnings mixed into the same `details["warnings"]` list as an English one from the same function. Two tests had pinned the Italian string as expected output (the same pattern #509 itself was caught by) — updated alongside the fix, not just the source.
+- **Competitive Narrative Analysis (`/api/analyze-competitors`) prompted the LLM entirely in Italian.** This live API endpoint (part of the bundled web app that also serves geoready.dev) sends a marketing analyst's brand-positioning prompt to whatever LLM provider is configured — with an English `system` message but Italian instruction text ("Richieste:", "Rispondi in JSON con struttura", etc.). For a product whose stated market is English-speaking, that risks the model's free-text analysis (adjectives, positioning statements) coming back in Italian despite the JSON keys being correctly specified in English. Both prompt templates translated; JSON field names were already English and are unchanged.
+- **The same endpoint rejected a bare domain as an invalid target URL.** `run_competitive_narrative_analysis` validated `target_url`/each `competitor_url` before normalizing its scheme, so `geoready.dev` (no `https://`) — a plausible real request body, and the exact input shape `geo audit` and every CLI command already normalize first — failed with "Scheme not allowed: ''. Only http/https." instead of being audited. Reproduced live: `run_competitive_narrative_analysis("geoready.dev", [])` returned that error; now normalizes both `target_url` and every `competitor_url` with the same `normalize_url_scheme()` before validating.
+
+---
+
+## [4.17.0] — 2026-08-30 · Parallax
+
+New LLM provider and multimodal prompt support (community-contributed), a User-Agent
+override for sites that block the default identity, a WebMCP readiness fix, and a
+duplication cleanup across the three JSON-LD `@graph` parsers.
+
+### Added
+- **MiniMax LLM provider.** `geo citations` can use `MiniMax-M3` or `MiniMax-M2.7` through either supported API wire format, with configurable global or China API roots and optional thinking control.
+- **Multimodal prompt content for `query_llm`.** The LLM client now accepts structured text/image content parts (`LLMContentPart`) alongside plain strings, forwarded verbatim to the provider's wire format. Video parts are not modelled yet.
+- **User-Agent override (#528).** `GEO_USER_AGENT` env var and `--user-agent` flag on `audit`, `access`, `fix` and `llms` let a request identify itself to sites that block the default `GEO-Optimizer/2.0` string (Akamai/Cloudflare bot management commonly return 403 to it, which previously read as a 0/100 "critical" score rather than a fetch problem). The override is resolved once per CLI invocation and deliberately does **not** apply to the CDN AI-crawler check, which sends a specific bot identity on purpose. Reported with a live repro (403→0/100 vs. 200→54/100 on the same site) in #528.
+
+### Fixed
+- **WebMCP readiness didn't credit tools registered by external bundled JS (#535).** `audit_webmcp_readiness` only scanned the raw HTML response for `registerTool()`; a modern bundler (Astro, Vite, Next, SvelteKit) emits that call into a hashed external script, not an inline one, so every production WebMCP implementation built with one scored `readiness_level: "none"` — reported live against a site with five working tools, a published `/webmcp/manifest.json`, and a `webmcp` block in `/ai/summary.json`, none of which moved the score. The check now reads that `/ai/summary.json` block via `ai_discovery`, already fetched by the audit for a different check, so crediting it costs no extra HTTP request — a genuine capability declared but statically invisible now counts as partial readiness instead of `none`.
+
+### Changed
+- **JSON-LD `@graph` parsing consolidated into one shared walker.** `citability.py`, `audit_schema.py` and `schema_injector.py` each carried an independent implementation of the same logic, with a different subset of edge cases covered by each — the exact duplication pattern behind fix #326, the 4.16.3 "twelve-walker" fix, and the 4.16.4 `schema_injector.py` gap. All three now call `utils.jsonld.iter_jsonld_objects()`, which combines the safest behavior found across them: nested `@graph` unpacking at any depth, `@context`/`@id` propagation to children, the DoS size guard from fix #182, and per-script parse-error tracking. `schema_injector.py`'s `analyze_html_file` gains nested-`@graph` support and the size guard it never had; no behavior change for `audit_schema.py` or `citability.py`. Not a response to a specific bug report — closing the duplication itself, since it is what made each individual fix necessary in the first place.
+
+---
+
+## [4.16.4] — 2026-08-14
+
+Patch release continuing the 4.16.3 dogfooding sweep — this time by running commands beyond
+`geo audit` against this project's own site. All four fixes are the same shape: a check that
+returned a confident, wrong answer instead of an error.
+
+### Fixed
+- **`geo perception` printed the trust score on the wrong scale.** `TrustStackResult.composite_score` is 0-25 (5 layers, 5 points each), but `perception_cmd.py` hardcoded `f"{trust_score:.0f}/100"`. On this project's own homepage, a composite of 18/25 — grade `B`, `high` trust per `geo audit` — printed as `Trust score: 18/100`, reading as a near-failure for a site the tool's own engine grades highly. `PerceptionSnapshot` now carries `trust_max` and `trust_grade` alongside `trust_score`, sourced from the same `TrustStackResult`, so the CLI prints `18/25 (B)` instead of assuming a denominator.
+- **`geo perception` picked the wrong brand name on this project's own homepage.** `_extract_brand_entity` took `names_found[0]` unconditionally. `names_found` is built from H1, title, og:title and schema, in that order — but the H1 on this site is a sentence-style heading with no separator ("Find the gaps that keep your site out of AI answers."), so it went in unsplit, while the title's actual site name sat *after* the separator and was discarded by a split that always keeps the first segment. Perception reported `Brand: Find the gaps that keep your site out of AI answers. (Organization)` and a summary reading "Find the gaps that keep your site out of AI answers. is a Organization" — also missing the "an" grammar. `BrandEntityResult` gains a `primary_name` field: schema Organization name first (structured data outranks positional guesses), then the candidate that repeats across sources, then the first one found — `names_found` itself is untouched. The summary builder also now picks "a" vs "an" from the entity label instead of always "a".
+- **`geo schema --analyze` didn't unpack `@graph`, and recommended schema that already existed.** Fix #326 (4.16.1) and the twelve-walker fix in 4.16.3 taught `citability.py` to unpack `{"@context", "@graph": [...]}` — the Yoast/RankMath default — but `schema_injector.py`'s `analyze_html_file` was a separate, untouched fourth file with the same gap (after `audit_brand.py`, `audit_schema.py` and `audit_webmcp.py`, which already handled it). On this project's own homepage, a single `@graph` block containing `Organization`, `WebSite` and a list-valued `@type: ["WebApplication", "SoftwareApplication"]` read as one schema typed `Unknown`; the command reported `Found 2 schema(s): FAQPage, Unknown` and suggested adding `WEBSITE`/`WEBAPP` — both already present. Now unpacks `@graph` and takes the first entry of a list-valued `@type`, matching the convention used elsewhere in the codebase.
+- **Instagram, TikTok and Threads did not count as platforms.** `_PLATFORM_DOMAINS` in `citability.py` listed nine domains; `SOCIAL_PROOF_DOMAINS` in `config.py` listed eight, and three of those — `instagram.com`, `tiktok.com`, `threads.net` — were absent from the first. A brand whose `sameAs` pointed at them got no credit for a presence it genuinely had. Since `multi_platform` scores by count (5 or more → 4 points, 3 or more → 2), three missing entries could cost a page a whole band, so this moves scores rather than only labels. The two lists are deliberately *not* identical in the other direction — GitHub, Medium, Reddit and Wikipedia are platforms without being social proof — so the new regression test pins `SOCIAL_PROOF_DOMAINS ⊆ _PLATFORM_DOMAINS` as a subset rather than an equality, which is the direction that was a defect. Found while fixing the `@graph` walkers in 4.16.3, where a test had been written asserting `platform_count == 4` on a fixture carrying five platforms, documenting the gap instead of failing on it.
+- **The scheduled-publish workflow's pre-flight check didn't validate every secret it uses.** The same change that replaced an httpbin-echo placeholder with a real bearer token (deploy reliability fix, same release cycle) added `DEPLOY_TRIGGER_TOKEN` as a third secret but only the original two (`SANITY_API_TOKEN`, `GEOREADY_DEPLOY_WEBHOOK_URL`) were checked for presence before the job proceeds. An unset `DEPLOY_TRIGGER_TOKEN` would have sent `Authorization: Bearer ` (empty) instead of failing fast — reproducing the exact silent-failure class that fix was meant to close. All three secrets are now validated in the same pre-flight step.
+
+---
+
+## [4.16.3] — 2026-08-13
+
+Patch release for four defects found by running this project's own audit against its own
+site. All four are corrections to checks that returned a confident wrong answer rather than
+an error, which is why none had been reported: the number looked plausible.
+
+The first one changes numbers users have already seen. **Citability scores will drop** —
+the scale was saturating at 100 halfway up, so a page reaching the top of the band was
+often only halfway there. Nothing about any audited page got worse; the metre was wrong and
+is now right. `raw_score` and `max_possible` are exposed alongside the total so the figure
+can be checked rather than trusted.
+
+### Fixed
+- **Citability saturated at 100 halfway up the scale.** `audit_citability` summed the 47 method scores and then clamped the result with `min(total, 100)`, under a comment reading `# Sum scores (max possible = 100)`. The methods actually expose **208** points — a figure the test suite has asserted since the RAG batch landed — so every page scoring 100 raw points or more was reported as `100/100 excellent`, and the top of the scale was reachable while roughly half the methods sat at zero. The report then contradicted itself: `grade: excellent` printed directly above "Add attributed quotes (+41% AI visibility)". Measured on this project's own homepage: 105 raw points out of 208 (**50.5%**, 14 methods at zero) was reported as `100/100 excellent`, and is now `50/100 foundation`. The score is normalized over the maximum the methods expose, derived from the methods themselves so adding a check later cannot silently reshape the scale again; `raw_score` and `max_possible` are now on `CitabilityResult`, so the normalized figure is auditable rather than opaque. **Existing scores will drop** — this corrects the metre, not the pages. Platform thresholds in `audit_platform.py` (`>= 60`, `>= 70`) were deliberately left untouched: they are expressed on a 0-100 scale and now finally receive a real percentage instead of a saturated one. A test asserting `total_score <= 100` documented the clamp as intentional and was updated; a second test asserting `grade in ("low", "medium", "high", "excellent")` turned out to be dead — `_compute_grade` has returned `critical/foundation/good/excellent` since fix #26 aligned it to `SCORE_BANDS`, and it only ever passed because the clamp forced every page to `excellent`.
+- **Mentioning ChatGPT was treated as undisclosed AI content.** `_AI_GENERATED_RE` in the hallucination-bait detector matched the bare product names `chatgpt|claude|bard|gemini|copilot`, so any page *writing about* AI search was flagged as AI-generated without a disclaimer — the exact audience this tool serves. On this project's own homepage the legitimate copy "…that stop ChatGPT, Perplexity, Claude, and Gemini from citing your site" produced 10 findings and `severity: high`, now 0 and `clean`. An assistant name only counts when paired with an authoring verb (`written by ChatGPT`, `created with Claude`, `drafted using an LLM`); `ai-generated` and `generated by ai` still match on their own. Both directions are covered by new regression tests.
+- **A collapsed mobile menu was reported as prompt injection.** `_detect_aria_hidden_injection` flagged any `aria-hidden` element holding more than 50 words, on the reasoning that a decorative element has no reason to carry prose. A collapsed mobile navigation menu is exactly that shape by design — duplicated links, hidden until opened — so this project's own homepage was reported at `risk_level: medium` for its `md:hidden` nav block: 143 words, 20 links, 99% of the words inside `<a>` tags, zero LLM-instruction patterns. The length rule now skips blocks whose text is at least 80% link labels, which is what distinguishes navigation from concealed prose. The instruction-pattern rule still runs on the same text, so directives hidden inside anchors remain detected — covered by a regression test in both directions.
+- **Nine citability methods were blind to `@graph` schema.** Fix #326 taught three of the twelve JSON-LD walkers in `citability.py` to unpack a `{"@context", "@graph": [...]}` container; the other nine kept reading top-level keys only. That container is the Yoast and RankMath default, so on most of WordPress `Organization`, `WebSite`, `Article` and their `sameAs` were invisible, and `entity_disambiguation`, `multi_platform`, `blog_structure`, `social_proof`, `international_geo`, `voice_search_ready` and `temporal_coherence` reported the signals as absent. Measured on a standard Yoast fixture: **2 of 17 available points before, 9 after**. Found while investigating why this project's own comparison page reported `names_consistent: false` and `sameas_count: 0` with four `sameAs` links present on the page. All twelve call sites now share one `_iter_jsonld_objects()` helper that unpacks nested containers and skips malformed JSON without discarding the valid schemas that follow it — the previous per-script `try/except` dropped an entire block on one bad character, and in `social_proof` a non-numeric `reviewCount` did the same. Ten regression tests were added; `@graph` had no citability coverage at all, which is how the gap survived #326.
+---
+
+## [4.16.2] — 2026-08-11
+
+### Fixed
+- **An HTTP error status was reported as "Connection failed".** `requests.Response.__bool__` is `ok`, i.e. `status_code < 400`, so a perfectly valid 403 carrying a full body is *falsy*. `if err or not r` therefore routed it down the "no response at all" branch: the audit reported `error="Connection failed"` and `http_status=0` for a request that had completed, and the branch immediately below — written to name the status and point at a Cloudflare/WAF block — was unreachable for every status ≥ 400. Reported from production, where a site answering 200 to a desktop browser and 403 to the server produced "Audit failed — Connection failed", sending the user after a network problem that did not exist. The recommendation string also interpolated a bare `err`, printing "Unable to reach X: None". Now `r is None`: `err` covers transport failures, the status branch covers HTTP errors. Same shape corrected in `mcp/server.py` and `factual_accuracy.py`; left alone in four other call sites where a `status_code != 200` guard or a `continue` immediately follows, so the falsy Response changes nothing observable.
+- **Every URL field rejected a bare hostname.** Five inputs across `AuditForm`, `CompareContainer` and `LlmsTxtGenerator` were `type="url"`, so the browser rejected `example.com` during native constraint validation — which runs *before* any submit handler, making JS normalisation unreachable. Every one of those fields shows a bare hostname as its placeholder, so each form refused exactly what it asked for. Now `type="text"` with `inputMode="url"` (URL keyboard on mobile, no scheme requirement) plus a shared `lib/urlInput.ts` helper, since none of the three components normalised on this branch. The hostname check there carries the weight `type="url"` used to: prepending `https://` makes `new URL()` accept `a`, `...` and `ftp://x.com`, which are now rejected with a readable message instead of a server error.
+
+---
+
+## [4.16.1] — 2026-08-11
+
+### Fixed
+- **Report leaked Italian strings into English output (#509).** Twelve user-facing strings were hardcoded in Italian — nine in the text formatter's `BRAND & ENTITY SIGNALS` section (`Brand name coerente`, `About page collegata`, `Informazioni di contatto presenti`, and the six negative branches), three in the rich formatter (`Nessuno schema trovato`, `Brand name coerente/incoerente`). Every English user saw them; nothing configuration-dependent. The `i18n` layer is imported "for future use" only, so these are now plain English literals rather than a half-wired `gettext` call. Reported by a user running 4.15.0 on Windows, who listed the four they happened to hit.
+- **Section 14 vanished without explanation (#509).** `EMBEDDING PROXIMITY` is conditional on the optional `sentence-transformers` extra, and the formatter used `skipped_reason` solely to suppress the section — never to print it. The reason string already existed upstream in `audit_embedding.py`, naming the exact `pip install geo-optimizer-skill[embedding]` command, so users got a hole in the numbering (13 followed by 15) instead of one actionable line. The header now always prints when the check ran, with `⏭️ Skipped: <reason>` when it did not complete. A test in `test_coverage_m1.py` asserted the Italian string as expected output, pinning the bug in place; it was updated alongside the fix.
+
+### Changed
+- **Scheduled-article publishing runs from the default branch (#512).** `.github/workflows/sanity-scheduled-publish.yml` had existed on a feature branch since 2026-07-28 and never executed once: GitHub only honours `schedule` and `workflow_dispatch` for workflows present on the default branch, so neither its 10-minute cron nor a manual dispatch was reachable. With 29 articles scheduled through 2026-11-23 and the build gate raising on any overdue one, an unpromoted article failed the entire site build silently, once per day. The workflow, the three scripts it invokes, and three `sanity:*` npm scripts are now on `main`. The `prebuild` hook was deliberately not ported: it wires the gate into every build, which would add a new CI failure mode on `main` to fix a problem that lives on the deploy branch.
+- **Codecov badge and upload removed.** The badge reported `unknown`: the OIDC upload in `ci.yml` never reached Codecov, so no report was ever ingested. On a project with 1777 passing tests a badge reading `unknown` misinforms, and generating `coverage.xml` on every run served nothing. Local coverage remains available via `pytest --cov=geo_optimizer`.
+
+---
+
+## [4.16.0] — 2026-08-06 · Ground Truth
+
+### Fixed
+- **Bot roster corrected against current vendor documentation (#512).** `Googlebot` was completely absent from `AI_BOTS`/`CITATION_BOTS` even though Google's own docs confirm AI Overviews are fed by Googlebot's crawl data, not by `Google-Extended` (which is a robots.txt opt-out token for Gemini/Vertex training, not a fetching agent). `Claude-User` (Anthropic's current on-demand fetch bot) was missing entirely, in its place were two identifiers — `anthropic-ai`, `claude-web` — that no longer appear in Anthropic's published crawler docs. `CITATION_BOTS` also mixed in `ClaudeBot` (training-only per Anthropic) while excluding `Googlebot`/`Applebot`; it now reads `{OAI-SearchBot, Claude-SearchBot, PerplexityBot, Googlebot, Applebot}`, matching the crawlers that actually drive AI citations. `Applebot` moved from the `training` to the `search` bot tier (`Applebot-Extended` is the training-only one).
+- **`geo access` CDN/WAF live-fetch check only simulated 3 bots.** `audit_cdn_ai_crawler` tested `GPTBot`/`ClaudeBot`/`PerplexityBot` — none of which include the actual search/citation crawlers the check exists to protect. Now tests the six bots that matter for citation-vs-training visibility: `GPTBot`, `OAI-SearchBot`, `PerplexityBot`, `Claude-SearchBot`, `Googlebot`, `Applebot`.
+
+### Added
+- **`geo access` reports TTFB and page weight.** Two access-layer signals a non-rendering AI crawler is sensitive to were entirely unmeasured: time-to-first-byte (warns above 500ms) and raw initial-HTML weight (warns above 200KB). Both come from the single fetch `geo access` already performs — no extra network call.
+- **`geo authority` flags orphan pages.** Previously reported interlinking only at the cluster/topic level; now also lists individual analyzed pages with zero inbound internal links from the other pages (homepage excluded — it's reachable by definition), since a page only reachable via the sitemap carries weak entity association even when crawled.
+
+## [4.15.0] — 2026-07-08 · Aperture
+
+### Added
+- **`geo perception` — deterministic AI perception snapshot (MVP C).** Aggregates brand, schema, citability, trust, and factual signals from a full audit into what an AI/retrieval system would likely extract from the page: brand entity, schema types, citability grade, trust score, supported/unsupported claims, and missing authority signals. Deterministic — no LLM call, no extra network beyond the audit — and always disclosed as simulated perception, not real AI output. Completes the Static-cycle MVP C alongside `geo drift` (MVP B) and `geo access`/`geo logs` (MVP A). Text and JSON output.
+
+### Changed
+- **`geo audit` suggests a badge embed for `good`/`excellent` scores.** The text and rich output now show a ready-to-paste `[![GEO Score](...)]` snippet pre-filled with the audited URL when the score clears the "good" band — the badge generator (`/badge`) already existed but was only documented in the README, not surfaced at the moment of the score itself.
+- **CLI funnel footers name the free monitoring tier.** geoready-platform shipped a free tier on 2026-06-30 (1 monitored domain + weekly drift email), but the `geo audit`/`geo drift` funnel footers still said generic "regression alerts" from before that feature existed. Updated to name exactly what's free.
+
+## [4.14.1] — 2026-06-27
+
+### Fixed
+- **Brand mention check counted same-named domains as the brand.** The brand matcher used a bare case-insensitive substring (`re.escape(brand)`), so brand `GeoReady` matched the unrelated `geoready.app`, inflating the brand mention rate (a real citation check on `geoready.dev` reported 100% mentions that were actually a homonym). The matcher now uses word boundaries plus a negative lookahead (`(?!\.\w)`) so the brand is not counted when it is merely the root of a domain/host. Word boundaries are applied conditionally so brands ending or starting with a non-word char still match (`C++`, `Yahoo!`, `.NET`). Extracted to `utils/brand_match.py` and reused across `citations`, `prompt_library`, `audit_persistence`, and `audit_citation_map` so the fix is consistent everywhere a brand is matched.
+- **HTTP session leak on cross-host redirect.** When a redirect pointed to a host with different pinned IPs, `fetch_url` recreated the `requests` session for the new IPs but never closed the previous one, orphaning its pooled connections. The old session is now closed before being replaced.
+
+## [4.14.0] — 2026-06-11 · Quiet Glass
+
+### Added
+- **`astro-geoready` npm integration (MVP: Astro distribution).** Makes an Astro site GEO-ready at build time: generates `llms.txt` (grouped by route section), `/.well-known/ai.txt`, and `/ai/summary.json` from the built route list — no crawling. Never overwrites existing files by default. Lives in `integrations/astro-geoready/`; geoready.dev dogfoods it in its own `astro.config.mjs`. 6 node:test cases.
+- **`geo drift` — semantic drift between saved snapshots (MVP B).** Compares the two most recent local history entries for a URL and reports score delta, per-category changes, crawlability regressions, and schema degradation with a severity verdict (`none`/`info`/`warning`/`critical`). `--fail-on warning|critical` gives CI a tripwire; JSON output included. Completes the Static-cycle MVP B: continuous drift monitoring with email alerts already runs in the platform's regression-alert pipeline.
+- **Free AI Citation Checker on geoready.dev** (`/tools/ai-citation-checker` + `POST /api/citations`): web version of `geo citations` backed by Perplexity Sonar, with verdict, mention/citation rates, competitor domains cited instead of you, and per-query evidence. Cost-guarded: disabled without `PERPLEXITY_API_KEY`, per-IP rate limit, global daily cap (`GEO_CITATIONS_DAILY_CAP`), two Sonar calls per check.
+- **Multimodal Readiness bonus check.** Multimodal engines (Gemini, GPT-4o) reach images, video, and audio through their text scaffolding: the audit now measures image alt coverage and `<figcaption>` usage, VideoObject/AudioObject/PodcastEpisode schema, `<track kind="captions">` subtitle tracks, and transcript presence, with a readiness level (none/missing/basic/good/excellent). Informational — does not affect the 100-point score; adds targeted recommendations and a `multimodal` JSON section.
+- **`geo authority` — site-level topical authority analysis.** AI engines map entities and multi-page topic coverage, not single pages. Groups sitemap pages into topic clusters by shared key terms (navigation boilerplate filtered out by document frequency, brand excluded), measures cluster depth, internal interlinking (hub-and-spoke), and pillar-page presence, and returns an authority score 0-100 with actionable recommendations. Text and JSON output.
+- **geoready.dev**: live *State of GEO* benchmark page (`/state-of-geo`, public teaser of the proprietary dataset), three companion guides (AI citations check, entity authority, multimodal GEO), newsletter capture, marketing visual system with image sitemap.
+
+### Changed
+- **Audit text and rich reports end with a platform funnel footer** (one-shot audit → score history, regression alerts, AI citation tracking at geoready.dev). Machine formats (json/sarif/junit/github) untouched.
+
+## [4.13.0] — 2026-06-10 · Echo
+
+### Added
+- **`geo citations` — one-shot AI citation check (bring your own API key).** Asks real AI answer engines the questions your customers ask and reports whether the brand is mentioned and the domain is cited as a source: per-query sources, competitor domains cited instead of you, mention/citation rates, and a verdict (`strong` / `cited` / `mentioned_only` / `invisible`). Text and JSON output.
+- **Perplexity provider in `llm_client`** — uses the core `requests` dependency (no `[llm]` extra needed) and populates the new `LLMResponse.citations` field with the source URLs Sonar grounds its answers in. Preferred provider for `geo citations`; OpenAI/Anthropic/Groq fall back to parametric brand-knowledge checks. Listed last in auto-detection so existing setups keep their provider.
+- README: 30-second terminal demo GIF (regenerable via `assets/demo.tape`), "Why this matters in 2026" sourced stats, zero-install `uvx` one-liner, score-badge viral section, codecov/tests badges.
+
+### Changed
+- **Recommendations are now ranked by recoverable points (gap #5).** Within each priority bucket, categories are ordered by how many points fixing them would recover for the audited site — a missing 16-point schema block now outranks a 2-point meta tweak. Order without a breakdown (direct `build_recommendations` callers) is unchanged; JSON contract unchanged (`recommendations` stays `list[str]`).
+
+### Fixed
+- CI coverage upload to Codecov failed with "Token required - not valid tokenless upload", leaving the coverage badge stuck on "unknown". Switched to OIDC tokenless upload (`id-token: write` + `use_oidc`).
+
+## [4.12.2] — 2026-06-03
+
+### Fixed
+- **`test_audit_contract.py` failed in CI without the `web` extra** — the 10 `test_web_api_*` contract tests (added in 4.12.0) import `geo_optimizer.web.app`, which requires FastAPI (`[web]` extra). CI installs only `[dev]`, so they raised `ModuleNotFoundError: No module named 'fastapi'` and kept the PyPI publish blocked. Added a `pytest.importorskip("fastapi", ...)` guard in the shared `_call_audit_result_to_dict` helper, matching the pattern already used in `test_web_app.py`.
+
+## [4.12.1] — 2026-06-03
+
+### Fixed
+- **Time-bomb tests in `test_citability.py`** — content-freshness and content-decay tests used hardcoded `dateModified` values asserted against freshness thresholds that are relative to *today*. As time passed the dates aged into different freshness bands, failing the suite and blocking the v4.12.0 PyPI publish (Docker shipped, PyPI stayed on 4.11.1). Tests now build dates relative to `datetime.now()`, keeping them stable over time. No runtime/library code changed.
+
+> Note: 4.12.1 was tagged but its PyPI publish was still blocked by the FastAPI import issue above; Docker `v4.12.1` shipped. 4.12.2 is the first publish to reach PyPI after the v4.12.0 regression.
+
+---
+
+## [4.12.0] — 2026-05-29
+
+### Changed
+- **Google AI scoring lens realigned to Google's AI optimization guide.** `_score_google_ai` no longer rewards `/.well-known/ai.txt` (Google's guide confirms machine-readable AI files like `llms.txt` and `ai.txt` are not used by AI features). The 10 points are redistributed to Google-confirmed signals: content freshness (+4), SSR-safe / non-JS-only content (+3), and descriptive image alt text (+3). Schema and `sameAs` rewards are retained because structured data still aids Search rich-result eligibility, on which AI Overviews ranking depends.
+- `audit_platform_citation()` gains a backward-compatible `js_rendering` parameter (defaults to `None`). The core 100-point score, `score_breakdown`, and the ChatGPT/Perplexity lenses are unchanged — only `platform_citation.google_ai` is affected. `llms.txt` remains rewarded for ChatGPT and Perplexity.
+
+### Added
+- **JSON contract v1** — `POST/GET /api/audit` responses now include `schema_version: 1`, always-present 8-category `score_breakdown`, flat alias keys (`robots_citation_ok`, `llms_found`, `llms_full`), and previously-missing `signals` / `ai_discovery` / `brand_entity` sections under `checks`. Documented in `docs/json-contract.md` with a frozen regression fixture.
+- **Frontend redesign** — floating-pill desktop navbar with scroll-shrink and active state, fullscreen mobile menu, GeoReady Pulse logo/favicon, softer corner radii, and teal theme color.
+
+### Fixed
+- **Python 3.9 web compatibility** — `asyncio.Lock()` instances are now created lazily inside the running event loop via `_get_lock(name)`, avoiding "no current event loop" at import time on Python 3.9 (module reload in tests, some ASGI servers).
+- Added `python-multipart` to the `web` extra (required for file uploads).
+
+### Notes
+- No breaking CLI changes. JSON contract additions are backward-compatible (consumers use `.get(key, default)`; missing `schema_version` → `0`).
+
+---
+
+## [4.11.1] — 2026-05-27
+
+### Fixed
+- Fixed runtime version mismatch where `geo --version` and `geo_optimizer.__version__` still reported `4.10.4` after the `4.11.0` package release.
+- Switched runtime version resolution to `importlib.metadata.version("geo-optimizer-skill")` with a source-checkout fallback (`"4.11.1"`) to prevent future version drift.
+- Updated web demo/frontend hardcoded version references from `v4.10.4` to `v4.11.1`.
+
+### Notes
+- No functional changes to Agent Access Audit or AI Crawler Activity.
+- No breaking changes.
+- `v4.11.0` remains valid but users should prefer `v4.11.1`.
+
+---
+
+## [4.11.0] — 2026-05-27
+
+### Added
+- **AI Crawler Activity Analytics** — new `POST /api/logs/analyze` endpoint and `geo logs` CLI command parse server access logs (Apache/Nginx common/combined formats) and aggregate AI crawler evidence by user-agent. Reports per-bot request counts, blocked/failing crawler detection (4xx/5xx ratios), top requested paths, and time-window summaries. Output is crawler evidence from log user-agents — **not** AI answer citation tracking.
+- **Agent Access Audit / Bot Simulator** — new `geo access` CLI command and `run_agent_access_audit()` core function simulate how AI agents experience a URL. Compares baseline browser access vs simulated AI bot user-agents (GPTBot, ClaudeBot, PerplexityBot, Google-Extended, etc.), surfacing differential blocking, robots.txt disallow rules, and HTTP-status divergence. Returns an overall status of `accessible | partial | blocked | unknown`.
+- **AgentAccessResult, SemanticDriftDelta, PerceptionSnapshot** dataclasses in `models/results.py` — public output contracts for the access audit, drift detection, and perception extraction workflows.
+- **drift_detector** core module — foundational scaffolding for semantic drift comparison between content snapshots (delta surface, citation-readiness signal hooks). Public model only in this release; full MVP B detector ships in a later cycle.
+- **perception_extractor** core module — extracts a *simulated* perception snapshot of how an AI agent would summarize a page from its HTML, schema, and meta signals. Output represents simulated perception, not what any specific AI assistant actually answers.
+- **GeoReady Platform integration** — dashboard and API surface in the hosted platform consume the new logs/analyze endpoint to render AI crawler activity per domain.
+
+### Tests
+- 1579 tests (all mocked, zero network), up from 1519
+- 60 new tests across `test_agent_access.py` (13), `test_drift_detector.py` (15), `test_perception_extractor.py` (19), `test_web_logs_endpoint.py` (5), `test_audit_contract.py` (8)
+
+### Notes
+- No breaking CLI changes. Existing `geo audit`, `geo fix`, `geo llms`, `geo schema` invocations are unchanged.
+- AI Crawler Activity reflects crawler user-agent evidence from server logs, **not** AI answer citation tracking.
+- Agent Access Audit reports *citation readiness* (whether a bot can reach and parse the page), **not** guaranteed AI citations.
+- Perception snapshots represent *simulated perception* derived from page signals, not the actual response of any AI assistant.
+
+### Codename — Static
+First release in the **Static** cycle: expanded retrieval surface analysis. MVP A delivers crawler-evidence and access-simulation primitives. MVP B (Semantic Drift detector), MVP C (AI Perception Snapshot enrichment), and MVP D (WordPress Connector) remain on the roadmap and are not yet shipped.
+
+---
+
+## [4.10.3] — 2026-05-10
+
+### Added
+- **Negative-Signal Penalty Framework** — GEO score now decreases when negative signals are detected: `X-Robots-Tag` headers restricting AI bots, `noai` / `noimageai` meta directives, and excessively high `Crawl-delay` values.
+- **Crawl-Delay Parsing** — `robots.txt` parser now recognizes the `Crawl-delay` directive per RFC 9309-style user-agent blocks.
+- **Freshness-Aware URL Ordering** — `llms.txt` generator uses sitemap `changefreq` and crawl-delay context to prioritize fresher pages.
+- **X-Robots-Tag Detection** — audit pipeline inspects HTTP response headers for bot-specific disallow or noindex rules.
+- **noai / noimageai Detection** — scans `<meta>` tags for AI-exclusion directives and records them as explicit negative signals.
+- **Schema Completeness** — validates required schema properties (`@context`, `@type`, `url`) and surfaces missing fields in audit results.
+- **Brand Sentiment Wiring** — recommendation priority now factors in brand-entity sentiment scores.
+- **Priority-Aware Batch Processing** — when URL lists exceed the batch limit, selection is prioritized by freshness, brand weight, and score impact instead of FIFO.
+- **SARIF & JUnit Enrichment** — SARIF output includes `signals` properties per rule; JUnit reports expose `ai_discovery` custom properties.
+- **CLI Input Validation** — `--threshold` enforces `[0, 100]` range; `--retention-days` rejects non-positive integers.
+- **i18n Guardrail** — `--lang` emits a warning when used before the full i18n subsystem is active.
+
+### Changed
+- **Config Centralization** — magic numbers, timeouts, score weights, and bot display strings moved to named constants in `models/config.py`.
+- **Type Annotations** — added across `core/` modules; fixed module-level logger names; added `__all__` to subpackages.
+
+### Fixed
+- `brand_entity` max-score calculation now correctly reflects the adjusted ceiling after penalties are applied.
+- SARIF serialization edge case where `brand_entity` max-score was emitted as a string instead of a float.
+
+### Tests
+- Expanded edge-case coverage for `soup=None` in schema validators and `FileCache` eviction logic.
+- Full suite validated across supported Python versions through CI.
+
+### Notes
+- No breaking CLI changes.
+- Existing audits may return slightly lower scores if previously ignored negative signals are now present — this is intentional and improves accuracy.
+
+---
+
+## [4.10.1] — 2026-05-05
+
+### Maintenance
+
+- Improved test coverage for site-wide semantic coherence orchestration.
+- Added focused coverage for competitive narrative analysis.
+- Added focused MCP server tests for selected tool paths.
+- Added provider-isolated LLM client tests with mocked OpenAI, Anthropic and Groq flows.
+- Strengthened mocked validation around external integrations to avoid real network or provider calls in tests.
+
+### Testing
+
+- `site_coherence.py` module coverage reached 98%.
+- `competitive_narrative.py` module coverage reached 82%.
+- Combined `mcp/server.py` coverage reached 66%.
+- `llm_client.py` module coverage reached 83%.
+- Full test suite validated across supported Python versions through CI.
+
+### Notes
+
+- No breaking changes.
+- No public CLI behavior changes expected.
+- This is a maintenance release focused on reliability, coverage and CI confidence.
+
+---
+## [4.10.0] — 2026-04-29
+
+### Added
+- **HTTP Retry with Exponential Backoff** (#401) — `fetch_url()` now retries on transient failures: timeouts, 5xx errors, connection errors, rate limiting (429). Configurable max attempts (3) and backoff factor (2s). Zero breaking changes.
+- **Telemetry System** (#403) — structured event tracking with `geo_` prefix for the web demo: `geo_audit_run`, `geo_score_improved`, `geo_suggestion_applied`, `geo_api_error`, `geo_badge_generated`. SQLite-backed (`~/.geo-optimizer/telemetry.db`) with singleton store for cross-request persistence.
+- **Hallucination Bait Detection** (#377) — detects 8 content patterns that cause LLM hallucinations: unsourced statistics, absolute claims, speculative statements, vague ranges, AI-generated signals, self-citations, missing measurement units, medical claims without disclaimer. Severity scoring (clean/low/medium/high). Integrated in audit pipeline.
+- **AI Search Intent Mapping** (#385) — analyzes page content across 4 intent categories (informational, navigational, transactional, commercial). Pattern matching in EN + IT with schema verification. Includes gap analysis, radar chart data (`[{axis, value}, ...]`), actionable recommendations, and Prompt Library taxonomy alignment (`map_prompt_library_intents()`).
+- **IntentMappingResult dataclass** — `intents_found`, `intents_missing`, `intent_details`, `primary_intent`, `gap_summary`, `recommendations`, `radar_data`, `prompt_library_intents`
+
+### Fixed
+- E501 line length violations in llms.txt and faq.json web endpoints
+
+### Tests
+- 1425 tests (all mocked, zero network), up from 1364
+- 61 new tests: 31 retry/backoff + 11 hallucination bait + 9 intent mapping gap analysis + 9 telemetry
+
+### Signal Architecture Refinement — Complete
+The v4.10 (Veil) cycle focused on signal quality and detection depth:
+1. Retry resilience for production audit reliability
+2. Usage telemetry to inform roadmap decisions
+3. Hallucination bait detection for AI content safety
+4. Intent mapping for content strategy guidance
 
 ---
 

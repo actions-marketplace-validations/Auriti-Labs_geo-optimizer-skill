@@ -16,20 +16,37 @@ import asyncio
 import dataclasses
 import hashlib
 import logging
+import mimetypes
 import os
 import re
 import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from geo_optimizer import __version__
+from geo_optimizer.core.llms_generator import (
+    discover_sitemap,
+    fetch_sitemap,
+    generate_llms_txt,
+)
+from geo_optimizer.core.telemetry import (
+    _telemetry,
+    geo_audit_run,
+    geo_badge_generated,
+    geo_score_improved,
+)
+from geo_optimizer.models.results import SitemapUrl
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +62,25 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Directory dei file statici del frontend Astro (buildato in Docker o via env)
+static_dir = Path(os.environ.get("GEO_STATIC_DIR", str(Path(__file__).parent / "static")))
+
 
 # ─── Middleware: POST body size limit ─────────────────────────────────────────
 _MAX_BODY_BYTES = 4 * 1024  # 4 KB — prevents DoS from unlimited POST bodies
+_MAX_LOG_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB for /api/logs/analyze
+_LOG_UPLOAD_PATH = "/api/logs/analyze"
 
 
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Rejects POST requests with body larger than _MAX_BODY_BYTES (fix #102)."""
+    """Rejects POST requests with body larger than _MAX_BODY_BYTES (fix #102).
+
+    Exception: /api/logs/analyze allows up to _MAX_LOG_UPLOAD_BYTES (10 MB).
+    """
 
     async def dispatch(self, request: Request, call_next):
         if request.method == "POST":
+            limit = _MAX_LOG_UPLOAD_BYTES if request.url.path == _LOG_UPLOAD_PATH else _MAX_BODY_BYTES
             content_length = request.headers.get("content-length")
             if content_length is not None:
                 try:
@@ -64,23 +90,50 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
                         status_code=400,
                         content={"detail": "Invalid Content-Length header."},
                     )
-                if length_bytes > _MAX_BODY_BYTES:
+                if length_bytes > limit:
                     return JSONResponse(
                         status_code=413,
-                        content={"detail": f"Body too large. Limit: {_MAX_BODY_BYTES} bytes."},
+                        content={"detail": f"Body too large. Limit: {limit} bytes."},
                     )
             else:
                 # Fix #411: enforce size limit on chunked/streaming bodies without Content-Length
                 try:
                     body = await request.body()
-                    if len(body) > _MAX_BODY_BYTES:
+                    if len(body) > limit:
                         return JSONResponse(
                             status_code=413,
-                            content={"detail": f"Body too large. Limit: {_MAX_BODY_BYTES} bytes."},
+                            content={"detail": f"Body too large. Limit: {limit} bytes."},
                         )
                 except Exception:
                     return JSONResponse(status_code=400, content={"detail": "Failed to read request body."})
         return await call_next(request)
+
+
+# ─── Middleware: Permanent trailing-slash redirects (SEO) ─────────────────────
+class PermanentRedirectMiddleware(BaseHTTPMiddleware):
+    """Converts StaticFiles trailing-slash redirects from 307 to 301.
+
+    StaticFiles(html=True) issues a 307 Temporary Redirect when a request
+    path is missing the trailing slash (e.g. /research -> /research/). For
+    SEO these must be 301 Permanent so Google consolidates link equity onto
+    the canonical (trailing-slash) URL instead of treating it as temporary.
+
+    Only rewrites GET/HEAD redirects that point to the same path plus a
+    trailing slash, leaving API and other redirects untouched.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if request.method in ("GET", "HEAD") and response.status_code == 307 and "location" in response.headers:
+            # Only promote to 301 when the redirect target is exactly the
+            # request path plus a trailing slash. Location may be absolute
+            # (ProxyHeaders rewrites it to https://host/path/), so compare
+            # the parsed path, not the raw header. This leaves any other
+            # 307 (API, future redirects) as a temporary redirect.
+            location_path = urlsplit(response.headers["location"]).path
+            if location_path == request.url.path + "/":
+                response.status_code = 301
+        return response
 
 
 # ─── Middleware: Security Headers ─────────────────────────────────────────────
@@ -93,10 +146,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next):
-        # Generate cryptographically secure nonce for each request
-        nonce = secrets.token_urlsafe(16)
-        # Make the nonce accessible to endpoints (e.g. homepage)
-        request.state.csp_nonce = nonce
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -104,15 +153,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         # Fix #315: HSTS — force HTTPS for 1 year on all subdomains
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        # Use 'nonce-{value}' instead of 'unsafe-inline' for XSS protection (fix #75)
-        # Note #287: style-src uses 'unsafe-inline' because all <style> tags are hardcoded
-        # in templates (not user-controllable). Removing it would require nonce on every style tag.
+        # 'unsafe-inline' required for Astro pre-built static HTML (inline hydration scripts)
+        # and for Google Analytics inline initialization.
+        # Nonce-based CSP cannot work with static files (HTML is pre-built without nonce injection).
         response.headers["Content-Security-Policy"] = (
-            f"default-src 'self'; script-src 'self' 'nonce-{nonce}'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
-            "img-src 'self' data:; frame-ancestors 'none'; "
-            "object-src 'none'; base-uri 'self'; form-action 'self'"
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "font-src 'self' data:; "
+            "img-src 'self' data: https://www.google-analytics.com https://www.googletagmanager.com "
+            "https://launchpadly.co https://cdn.sanity.io; "
+            # region1.google-analytics.com: endpoint regionale GA4 (usato da gtag.js)
+            "connect-src 'self' https://www.google-analytics.com https://analytics.google.com "
+            "https://stats.g.doubleclick.net https://region1.google-analytics.com; "
+            "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
         )
         # Fix #413: restrict browser API access
         response.headers["Permissions-Policy"] = (
@@ -124,6 +178,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(BodySizeLimitMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(PermanentRedirectMiddleware)
+# ProxyHeadersMiddleware propagates X-Forwarded-Proto to Starlette scope,
+# so StaticFiles trailing-slash redirects use https:// not http://
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["127.0.0.1", "::1"])
 
 # CORS: configurable via ALLOWED_ORIGINS env var (fix #183)
 # Default "*" for public demo. In production set ALLOWED_ORIGINS=https://yourdomain.com
@@ -174,7 +232,23 @@ _rate_limit_store: dict = {}  # {ip: [timestamp, ...]}
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX_REQUESTS = 30  # requests per window per IP
 _RATE_LIMIT_MAX_IPS = 10000  # maximum number of tracked IPs
-_rate_limit_lock = asyncio.Lock()  # race condition protection on _rate_limit_store
+
+# Locks are created lazily inside the running event loop. On Python 3.9
+# asyncio.Lock() binds the current event loop at construction time, so building
+# it at import time raises "no current event loop" (e.g. on module reload in
+# tests, or under some ASGI servers). Lazy creation defers binding to first use,
+# which always happens inside an active loop.
+_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_lock(name: str) -> asyncio.Lock:
+    """Return a named asyncio.Lock, creating it on first use within the loop."""
+    lock = _locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[name] = lock
+    return lock
+
 
 # ─── Proxy trust: list of trusted proxy CIDRs/IPs ─────────────────────────────
 # Configurable via TRUSTED_PROXIES environment variable (CSV of IPs/CIDRs).
@@ -239,7 +313,7 @@ async def _check_rate_limit(client_ip: str) -> bool:
     """
     # Fix #312: stricter limit for unknown IP (prevents bypass with client None)
     max_requests = 5 if client_ip == "unknown" else _RATE_LIMIT_MAX_REQUESTS
-    async with _rate_limit_lock:
+    async with _get_lock("rate_limit"):
         now = time.time()
         timestamps = _rate_limit_store.get(client_ip, [])
         # Remove timestamps outside the time window
@@ -260,8 +334,6 @@ async def _check_rate_limit(client_ip: str) -> bool:
 _audit_cache: dict = {}
 _CACHE_TTL = 3600
 _MAX_CACHE_SIZE = 500
-_audit_cache_lock = asyncio.Lock()  # race condition protection on _audit_cache (fix #209)
-_stats_cache_lock = asyncio.Lock()  # race condition protection on stats cache (#456)
 
 
 def _cache_key(url: str) -> str:
@@ -279,7 +351,7 @@ async def _get_cached(url: str) -> dict | None:
     Fix race condition: uses asyncio.Lock to protect the atomic
     read/remove on _audit_cache (fix #209).
     """
-    async with _audit_cache_lock:
+    async with _get_lock("audit_cache"):
         key = _cache_key(url)
         entry = _audit_cache.get(key)
         if entry and (time.time() - entry["cached_at"]) < _CACHE_TTL:
@@ -291,7 +363,7 @@ async def _get_cached(url: str) -> dict | None:
 
 
 def _evict_expired() -> None:
-    """Remove expired entries from cache. Caller must hold _audit_cache_lock."""
+    """Remove expired entries from cache. Caller must hold the audit_cache lock."""
     now = time.time()
     expired = [k for k, v in _audit_cache.items() if (now - v["cached_at"]) >= _CACHE_TTL]
     for k in expired:
@@ -304,7 +376,7 @@ async def _set_cached(url: str, data: dict) -> str:
     Fix race condition: uses asyncio.Lock to protect the
     check-size / evict / insert block on _audit_cache (fix #209).
     """
-    async with _audit_cache_lock:
+    async with _get_lock("audit_cache"):
         key = _cache_key(url)
         # Avoid unbounded growth: evict expired entries, then remove oldest
         if len(_audit_cache) >= _MAX_CACHE_SIZE:
@@ -316,48 +388,53 @@ async def _set_cached(url: str, data: dict) -> str:
         return key
 
 
-@app.get("/", response_class=HTMLResponse)
-async def homepage(request: Request):
-    """Homepage with form for GEO audit."""
-    # Fix #75: retrieve the CSP nonce set by SecurityHeadersMiddleware
-    nonce = getattr(request.state, "csp_nonce", "")
-    return _render_homepage(nonce=nonce)
-
+# @app.get("/", response_class=HTMLResponse)
+# async def homepage(request: Request):
+#     """Homepage with form for GEO audit."""
+#     # Fix #75: retrieve the CSP nonce set by SecurityHeadersMiddleware
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     return _render_homepage(nonce=nonce)
 
 # ─── Pagine statiche informative ──────────────────────────────────────────────
 
 
-@app.get("/roadmap", response_class=HTMLResponse)
-async def roadmap_page(request: Request):
-    """Public roadmap: Now / Next / Later — no dates, just direction."""
-    # Fix #313: propaga nonce per coerenza CSP (template privo di script al momento)
-    nonce = getattr(request.state, "csp_nonce", "")
-    nonce_attr = f' nonce="{nonce}"' if nonce else ""
-    template_path = Path(__file__).parent / "templates" / "roadmap.html"
-    html = template_path.read_text(encoding="utf-8")
-    return html.replace("__NONCE_ATTR__", nonce_attr)
+# @app.get("/roadmap", response_class=HTMLResponse)
+# async def roadmap_page(request: Request):
+#     """Public roadmap: Now / Next / Later — no dates, just direction."""
+#     # Fix #313: propaga nonce per coerenza CSP (template privo di script al momento)
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     nonce_attr = f' nonce="{nonce}"' if nonce else ""
+#     template_path = Path(__file__).parent / "templates" / "roadmap.html"
+#     html = template_path.read_text(encoding="utf-8")
+#     return html.replace("__NONCE_ATTR__", nonce_attr)
 
+# @app.get("/research", response_class=HTMLResponse)
+# async def research_page(request: Request):
+#     """Research foundation: peer-reviewed papers behind the scoring."""
+#     # Fix #313: propaga nonce per coerenza CSP (template privo di script al momento)
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     nonce_attr = f' nonce="{nonce}"' if nonce else ""
+#     template_path = Path(__file__).parent / "templates" / "research.html"
+#     html = template_path.read_text(encoding="utf-8")
+#     return html.replace("__NONCE_ATTR__", nonce_attr)
 
-@app.get("/research", response_class=HTMLResponse)
-async def research_page(request: Request):
-    """Research foundation: peer-reviewed papers behind the scoring."""
-    # Fix #313: propaga nonce per coerenza CSP (template privo di script al momento)
-    nonce = getattr(request.state, "csp_nonce", "")
-    nonce_attr = f' nonce="{nonce}"' if nonce else ""
-    template_path = Path(__file__).parent / "templates" / "research.html"
-    html = template_path.read_text(encoding="utf-8")
-    return html.replace("__NONCE_ATTR__", nonce_attr)
+# @app.get("/manifesto", response_class=HTMLResponse)
+# async def manifesto_page(request: Request):
+#     """The GEO Optimizer Manifesto — philosophy and principles."""
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     nonce_attr = f' nonce="{nonce}"' if nonce else ""
+#     template_path = Path(__file__).parent / "templates" / "manifesto.html"
+#     html = template_path.read_text(encoding="utf-8")
+#     return HTMLResponse(html.replace("__NONCE_ATTR__", nonce_attr))
 
-
-@app.get("/manifesto", response_class=HTMLResponse)
-async def manifesto_page(request: Request):
-    """The GEO Optimizer Manifesto — philosophy and principles."""
-    nonce = getattr(request.state, "csp_nonce", "")
-    nonce_attr = f' nonce="{nonce}"' if nonce else ""
-    template_path = Path(__file__).parent / "templates" / "manifesto.html"
-    html = template_path.read_text(encoding="utf-8")
-    return HTMLResponse(html.replace("__NONCE_ATTR__", nonce_attr))
-
+# @app.get("/privacy", response_class=HTMLResponse)
+# async def privacy_page(request: Request):
+#     """Privacy Policy page - GDPR compliant."""
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     nonce_attr = f' nonce="{nonce}"' if nonce else ""
+#     template_path = Path(__file__).parent / "templates" / "privacy.html"
+#     html = template_path.read_text(encoding="utf-8")
+#     return HTMLResponse(html.replace("__NONCE_ATTR__", nonce_attr))
 
 # ─── Documentazione online (Markdown → HTML) ─────────────────────────────────
 
@@ -372,6 +449,7 @@ _DOCS_PAGES = {
     "mcp-server": "MCP Server",
     "ai-context": "Using as AI Context",
     "geo-methods": "The 11 GEO Methods",
+    "geo-perception": "AI Perception Snapshot",
     "ai-bots-reference": "AI Bots Reference",
     "ci-cd": "CI/CD Integration",
     "scoring-rubric": "Scoring Rubric",
@@ -491,15 +569,23 @@ def _markdown_to_html(md: str) -> str:
         return html
 
 
-@app.get("/compare", response_class=HTMLResponse)
-async def compare_page(request: Request):
-    """Compare GEO scores of two websites side by side."""
-    nonce = getattr(request.state, "csp_nonce", "")
-    template_path = Path(__file__).parent / "templates" / "compare.html"
-    html = template_path.read_text(encoding="utf-8")
-    nonce_attr = f' nonce="{nonce}"' if nonce else ""
-    return html.replace("__NONCE_ATTR__", nonce_attr)
+# @app.get("/compare", response_class=HTMLResponse)
+# async def compare_page(request: Request):
+#     """Compare GEO scores of two websites side by side."""
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     template_path = Path(__file__).parent / "templates" / "compare.html"
+#     html = template_path.read_text(encoding="utf-8")
+#     nonce_attr = f' nonce="{nonce}"' if nonce else ""
+#     return html.replace("__NONCE_ATTR__", nonce_attr)
 
+# @app.get("/analyze-competitors", response_class=HTMLResponse)
+# async def analyze_competitors_page(request: Request):
+#     """Competitive narrative analysis page."""
+#     nonce = getattr(request.state, "csp_nonce", "")
+#     template_path = Path(__file__).parent / "templates" / "analyze_competitors.html"
+#     html = template_path.read_text(encoding="utf-8")
+#     nonce_attr = f' nonce="{nonce}"' if nonce else ""
+#     return html.replace("__NONCE_ATTR__", nonce_attr)
 
 # ─── Stats API esterna (AgencyPilot) ─────────────────────────────────────────
 # Audit counter persisted on an external SQLite DB via REST API
@@ -583,7 +669,7 @@ async def stats():
 
     # Fix #456 + thundering herd: hold lock for the entire check-fetch-write cycle
     # so only one coroutine fetches while others wait for the cached result
-    async with _stats_cache_lock:
+    async with _get_lock("stats_cache"):
         cached = getattr(stats, cache_key, None)
         if cached and (_time.time() - cached["ts"]) < cache_ttl:
             return cached["data"]
@@ -654,6 +740,23 @@ class AuditRequest(BaseModel):
     url: str
 
 
+class LlmsGenerateRequest(BaseModel):
+    """Schema for the POST /api/llms/generate request body (Sprint 3).
+
+    Pydantic valida i tipi: input non-stringa restituisce 422, non 500.
+    """
+
+    # Pydantic valuta le annotazioni dei field a runtime: la sintassi PEP 604
+    # `str | None` rompe su Python 3.9 (CI #194) anche con `from __future__`.
+    # Optional[str] resta valutabile su 3.9 e identico semanticamente. Il noqa
+    # deroga UP045 solo qui: altrove `X | None` è corretto (annotazioni lazy).
+    base_url: str
+    sitemap_url: Optional[str] = None  # noqa: UP045
+    site_name: Optional[str] = None  # noqa: UP045
+    description: Optional[str] = None  # noqa: UP045
+    max_per_section: int = 10
+
+
 @app.get("/api/audit")
 async def audit_get(
     request: Request,
@@ -693,6 +796,301 @@ async def audit_post(request: Request, body: AuditRequest):
     return await _run_audit(body.url)
 
 
+# Limiti clamp per max_per_section: minimo 1, massimo 20 link per sezione
+_LLMS_MIN_PER_SECTION = 1
+_LLMS_MAX_PER_SECTION = 20
+# Timeout complessivo per discovery + fetch sitemap + generazione (secondi)
+_LLMS_GENERATE_TIMEOUT = 30
+
+
+async def _build_llms_content(
+    url: str,
+    sitemap_resolved: str | None,
+    body: LlmsGenerateRequest,
+    max_per_section: int,
+) -> tuple[str, int, bool]:
+    """Genera il contenuto llms.txt riusando la pipeline anti-SSRF del core.
+
+    discover_sitemap/fetch_sitemap validano internamente ogni URL con
+    resolve_and_validate_url (anti-SSRF + DNS pinning); qui ci limitiamo a
+    orchestrare le funzioni sincrone in thread separati.
+
+    Args:
+        url: base URL normalizzato e gia validato (difesa a strati).
+        sitemap_resolved: URL sitemap fornito e validato, oppure None.
+        body: corpo della richiesta con site_name/description.
+        max_per_section: numero massimo di link per sezione (gia clampato).
+
+    Returns:
+        Tupla (content, url_count, found_sitemap).
+    """
+    # Se non abbiamo una sitemap esplicita, proviamo a scoprirla (anti-SSRF interno)
+    if sitemap_resolved is None:
+        sitemap_resolved = await asyncio.to_thread(discover_sitemap, url)
+
+    # Nessuna sitemap: fallback minimale alla sola homepage (NON e un errore)
+    if sitemap_resolved is None:
+        return await _build_minimal_llms(url, body, max_per_section), 1, False
+
+    # Sitemap presente: scarichiamo gli URL (fetch_sitemap ritorna [] su errore)
+    urls = await asyncio.to_thread(fetch_sitemap, sitemap_resolved)
+    if not urls:
+        # Sitemap vuota o non parsabile: fallback minimale alla homepage
+        return await _build_minimal_llms(url, body, max_per_section), 1, False
+
+    # fetch_titles SEMPRE False: niente fetch per-pagina nell'endpoint web
+    content = await asyncio.to_thread(
+        generate_llms_txt,
+        url,
+        urls,
+        body.site_name,
+        body.description,
+        False,
+        max_per_section,
+    )
+    return content, len(urls), True
+
+
+async def _build_minimal_llms(
+    url: str,
+    body: LlmsGenerateRequest,
+    max_per_section: int,
+) -> str:
+    """Genera un llms.txt minimale contenente solo la homepage."""
+    urls = [SitemapUrl(url=url, priority=1.0)]
+    return await asyncio.to_thread(
+        generate_llms_txt,
+        url,
+        urls,
+        body.site_name,
+        body.description,
+        False,
+        max_per_section,
+    )
+
+
+@app.post("/api/llms/generate")
+async def llms_generate(request: Request, body: LlmsGenerateRequest):
+    """Genera un file llms.txt a partire dalla sitemap del sito (Sprint 3).
+
+    Riusa la pipeline anti-SSRF esistente: discover_sitemap e fetch_sitemap
+    validano ogni URL internamente con resolve_and_validate_url (DNS pinning,
+    size check, anti-bomb). Come difesa a strati, validiamo comunque base_url
+    e l'eventuale sitemap_url con validate_public_url prima di passarli al core.
+
+    Nessun salvataggio su disco: il contenuto e restituito solo nella response.
+    """
+    from geo_optimizer.utils.validators import validate_public_url
+
+    # Verifica token (stessa policy di /api/audit)
+    if not _verify_bearer_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not await _check_rate_limit(_get_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again soon.")
+
+    # Clamp del numero di link per sezione entro [1, 20]
+    max_per_section = max(_LLMS_MIN_PER_SECTION, min(body.max_per_section, _LLMS_MAX_PER_SECTION))
+
+    # Normalizza e valida il base URL (difesa a strati anti-SSRF)
+    url, error = _normalize_url(body.base_url)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    safe, reason = validate_public_url(url)
+    if not safe:
+        raise HTTPException(status_code=400, detail=f"Unsafe URL: {reason}")
+
+    # Se la sitemap e fornita esplicitamente, normalizzala e validala anch'essa
+    sitemap_resolved: str | None = None
+    if body.sitemap_url:
+        sitemap_resolved, sm_error = _normalize_url(body.sitemap_url)
+        if sm_error:
+            raise HTTPException(status_code=400, detail=sm_error)
+        sm_safe, sm_reason = validate_public_url(sitemap_resolved)
+        if not sm_safe:
+            raise HTTPException(status_code=400, detail=f"Unsafe URL: {sm_reason}")
+
+    # Orchestrazione con timeout complessivo: discovery + fetch + generazione
+    try:
+        content, url_count, found_sitemap = await asyncio.wait_for(
+            _build_llms_content(url, sitemap_resolved, body, max_per_section),
+            timeout=_LLMS_GENERATE_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.warning("llms.txt generation timeout (%ss) for URL: %s", _LLMS_GENERATE_TIMEOUT, url)
+        raise HTTPException(
+            status_code=504,
+            detail="Sitemap processing timed out. Try providing a sitemap URL directly.",
+        ) from exc
+    except HTTPException:
+        # Re-raise degli errori HTTP gia mappati (es. 400/401/429)
+        raise
+    except Exception as e:
+        # Errore generico: non esporre dettagli interni al client
+        logger.error("llms.txt generation error for %s: %s", url, e)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error generating llms.txt.",
+        ) from e
+
+    return {
+        "base_url": url,
+        "sitemap_url": sitemap_resolved or None,
+        "found_sitemap": found_sitemap,
+        "url_count": url_count,
+        "content": content,
+        "line_count": content.count("\n") + 1 if content else 0,
+        "size_bytes": len(content.encode("utf-8")),
+    }
+
+
+# ─── AI Citation Check (free tool, cost-guarded) ─────────────────────────────
+# Each check makes outbound Perplexity Sonar calls paid by the deployment
+# owner, so on top of the per-IP rate limit there is a hard global daily cap
+# and the endpoint stays disabled unless a key is explicitly configured.
+
+_CITATIONS_MAX_QUERIES = 2  # Sonar calls per check
+_CITATIONS_TIMEOUT = 90  # seconds for the whole check
+_CITATIONS_DAILY_CAP = int(os.environ.get("GEO_CITATIONS_DAILY_CAP", "50"))
+_CITATIONS_QUERY_TEMPLATES = [
+    "What is the best tool for {topic}?",
+    "What do you recommend for {topic}?",
+]
+
+_citations_day = ""  # UTC date of the counter below
+_citations_count = 0
+
+
+async def _reserve_citations_slot() -> bool:
+    """Reserve one slot in the global daily cap (UTC day, in-memory)."""
+    global _citations_day, _citations_count
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with _get_lock("citations_cap"):
+        if _citations_day != today:
+            _citations_day = today
+            _citations_count = 0
+        if _citations_count >= _CITATIONS_DAILY_CAP:
+            return False
+        _citations_count += 1
+        return True
+
+
+class CitationsCheckRequest(BaseModel):
+    """Schema for the POST /api/citations request body."""
+
+    brand: str
+    domain: str
+    topic: Optional[str] = None  # noqa: UP045 (Python 3.9 runtime annotations)
+
+
+@app.post("/api/citations")
+async def citations_check(request: Request, body: CitationsCheckRequest):
+    """One-shot AI citation check: is the brand mentioned / the domain cited?
+
+    Queries Perplexity Sonar (real web citations) with customer-style
+    questions. No URL is fetched, so there is no SSRF surface; the cost
+    surface is guarded by the per-IP rate limit, a global daily cap, and
+    a hard limit of two Sonar calls per check.
+    """
+    perplexity_key = os.environ.get("PERPLEXITY_API_KEY", "")
+    if not perplexity_key:
+        raise HTTPException(status_code=503, detail="AI citation check is not enabled on this deployment.")
+
+    if not _verify_bearer_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not await _check_rate_limit(_get_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again soon.")
+
+    brand = body.brand.strip()
+    if not 2 <= len(brand) <= 80:
+        raise HTTPException(status_code=400, detail="Brand must be 2-80 characters.")
+
+    from geo_optimizer.core.citations import normalize_domain, run_citation_check
+
+    domain = normalize_domain(body.domain)
+    if "." not in domain or len(domain) > 253:
+        raise HTTPException(status_code=400, detail="Provide a valid domain, e.g. example.com.")
+
+    topic = (body.topic or "").strip()[:120] or brand
+
+    if not await _reserve_citations_slot():
+        raise HTTPException(
+            status_code=429,
+            detail="Daily check budget exhausted. Try again tomorrow or track citations at app.geoready.dev.",
+        )
+
+    queries = [t.format(topic=topic) for t in _CITATIONS_QUERY_TEMPLATES[:_CITATIONS_MAX_QUERIES]]
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_citation_check,
+                brand,
+                domain,
+                topic=topic,
+                queries=queries,
+                provider="perplexity",
+                api_key=perplexity_key,
+            ),
+            timeout=_CITATIONS_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.warning("Citation check timeout (%ss) for brand %s", _CITATIONS_TIMEOUT, brand)
+        raise HTTPException(status_code=504, detail="Citation check timed out. Try again.") from exc
+    except Exception as e:
+        logger.error("Citation check error for %s: %s", brand, e)
+        raise HTTPException(status_code=500, detail="Internal error running the citation check.") from e
+
+    if result.skipped_reason:
+        logger.warning("Citation check skipped for %s: %s", brand, result.skipped_reason)
+        raise HTTPException(status_code=502, detail="The AI provider did not return answers. Try again.")
+
+    return {
+        "brand": result.brand,
+        "domain": result.domain,
+        "verdict": result.verdict,
+        "queries_run": result.queries_run,
+        "brand_mention_rate": result.brand_mention_rate,
+        "domain_citation_rate": result.domain_citation_rate,
+        "top_cited_domains": result.top_cited_domains,
+        "entries": [
+            {
+                "query": e.query,
+                "brand_mentioned": e.brand_mentioned,
+                "domain_cited": e.domain_cited,
+                "cited_sources": e.cited_sources[:3],
+                "snippet": e.snippet,
+            }
+            for e in result.entries
+            if not e.error
+        ],
+    }
+
+
+@app.get("/report/demo", response_class=HTMLResponse)
+async def report_demo_page():
+    """Serve la pagina demo report dal frontend Astro."""
+    file_path = static_dir / "report" / "demo" / "index.html"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Demo report not found")
+    return HTMLResponse(file_path.read_text(encoding="utf-8"))
+
+
+@app.get("/report/audit", response_class=HTMLResponse)
+async def report_audit_page():
+    """Serve la pagina audit report dal frontend Astro."""
+    file_path = static_dir / "report" / "audit" / "index.html"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audit report not found")
+    return HTMLResponse(file_path.read_text(encoding="utf-8"))
+
+
 @app.get("/report/{report_id}", response_class=HTMLResponse)
 async def report(report_id: str):
     """Temporary report valid for 1 hour, kept in memory. Restarting the server clears all reports."""
@@ -705,7 +1103,7 @@ async def report(report_id: str):
     # Fix #286: cache access protected by lock to avoid race condition
     # Fix #343: check TTL — expired reports are no longer served
     # Fix #457: extract data inside lock to prevent concurrent mutation
-    async with _audit_cache_lock:
+    async with _get_lock("audit_cache"):
         entry = _audit_cache.get(report_id)
         if entry and (time.time() - entry.get("cached_at", 0)) >= _CACHE_TTL:
             entry = None
@@ -880,6 +1278,9 @@ async def badge(
 
     from geo_optimizer.web.badge import generate_badge_svg
 
+    # v4.10: emit geo_badge_generated telemetry event
+    geo_badge_generated(url=url, score=score, band=band)
+
     svg = generate_badge_svg(score, band, label=label)
     return Response(
         content=svg,
@@ -899,7 +1300,7 @@ async def badge_endpoint(
     """Endpoint compatibile con shields.io per badge dinamico.
 
     Usage with shields.io:
-        ![GEO Score](https://img.shields.io/endpoint?url=https://geo-optimizer-web.onrender.com/badge/endpoint?url=https://yoursite.com)
+        ![GEO Score](https://img.shields.io/endpoint?url=https://geoready.dev/badge/endpoint?url=https://yoursite.com)
 
     Returns JSON in shields.io schema:
         {"schemaVersion": 1, "label": "GEO Score", "message": "77/100", "color": "green"}
@@ -969,6 +1370,8 @@ def _normalize_url(raw: str) -> tuple[str | None, str]:
     """
     from urllib.parse import urlparse
 
+    from geo_optimizer.utils.validators import normalize_url_scheme
+
     url = raw.strip()
 
     # Empty or contains spaces — not a URL
@@ -976,8 +1379,7 @@ def _normalize_url(raw: str) -> tuple[str | None, str]:
         return None, "Invalid input: please enter a URL (e.g. https://example.com)"
 
     # Add https:// if protocol is missing
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    url = normalize_url_scheme(url)
 
     # Must have a hostname with at least one dot (real domain)
     parsed = urlparse(url)
@@ -1011,6 +1413,8 @@ async def _run_audit(url: str) -> JSONResponse:
             response_data["history"] = history_summary
         return JSONResponse(content=response_data)
 
+    # v4.10: telemetry — capture duration for geo_audit_run event
+    t_start = time.perf_counter()
     # Run audit
     try:
         from geo_optimizer.core.audit import run_full_audit
@@ -1033,11 +1437,31 @@ async def _run_audit(url: str) -> JSONResponse:
             detail="Internal error during audit. Try again later.",
         ) from e
 
+    duration_ms = int((time.perf_counter() - t_start) * 1000)
+
     # Serialize result
     data = _audit_result_to_dict(result)
     history_summary = await asyncio.to_thread(_save_and_load_history_summary, result)
     if history_summary:
         data["history"] = history_summary
+
+    # v4.10: emit geo_audit_run telemetry event (singleton store)
+    geo_audit_run(
+        url=result.url,
+        score=result.score,
+        band=result.band,
+        duration_ms=duration_ms,
+        score_breakdown=dict(result.score_breakdown),
+    )
+
+    # v4.10: emit geo_score_improved if score increased vs previous
+    previous = _telemetry().get_latest_audit_score(result.url)
+    if previous is not None and result.score > previous:
+        geo_score_improved(
+            url=result.url,
+            previous_score=previous,
+            current_score=result.score,
+        )
 
     # Incrementa contatore audit sul DB persistente (AgencyPilot)
     await asyncio.to_thread(_increment_remote_stat, "audits")
@@ -1084,12 +1508,22 @@ def _audit_result_to_dict(result) -> dict:
     Uses dataclasses.asdict() as the base to avoid losing fields,
     then adds the nested calculated "checks" fields for API compatibility.
     Fix #151: the previous version lost 10+ result fields.
+    Schema v1: adds schema_version, alias keys for platform consumers.
     """
     # Full base via dataclasses.asdict (includes all fields)
     base = dataclasses.asdict(result)
 
-    # Add the "checks" mapping (structure expected by the frontend)
+    # JSON contract version — consumers must handle missing (default 0 = pre-v1)
+    base["schema_version"] = 1
+
+    # Garantisce le 8 categorie sempre presenti nel score_breakdown (valore 0 se audit non eseguito)
+    _BREAKDOWN_KEYS = ("robots", "llms", "schema", "meta", "content", "signals", "ai_discovery", "brand_entity")
+    base["score_breakdown"] = {k: base.get("score_breakdown", {}).get(k, 0) for k in _BREAKDOWN_KEYS}
+
+    # Add the "checks" mapping (structure expected by the frontend and platform)
+    # Keys under checks must match gate_service.CATEGORY_KEY_MAP and analytics_dashboard
     base["checks"] = {
+        # ── robots ──────────────────────────────────────────────────────────
         "robots_txt": {
             "found": result.robots.found,
             "citation_bots_ok": result.robots.citation_bots_ok,
@@ -1099,14 +1533,22 @@ def _audit_result_to_dict(result) -> dict:
             "bots_missing": result.robots.bots_missing,
             "bots_partial": result.robots.bots_partial,
         },
+        # Alias keys used by analytics_dashboard and gate_service CATEGORY_KEY_MAP
+        "robots_citation_ok": result.robots.citation_bots_ok,
+        # ── llms ─────────────────────────────────────────────────────────────
         "llms_txt": {
             "found": result.llms.found,
             "has_h1": result.llms.has_h1,
             "has_description": result.llms.has_description,
             "has_sections": result.llms.has_sections,
             "has_links": result.llms.has_links,
+            "has_full": result.llms.has_full,
             "word_count": result.llms.word_count,
         },
+        # Alias keys used by analytics_dashboard
+        "llms_found": result.llms.found,
+        "llms_full": result.llms.has_full,
+        # ── schema ───────────────────────────────────────────────────────────
         "schema_jsonld": {
             "found_types": result.schema.found_types,
             "has_website": result.schema.has_website,
@@ -1119,6 +1561,7 @@ def _audit_result_to_dict(result) -> dict:
             "schema_richness_score": result.schema.schema_richness_score,
             "raw_schemas": result.schema.raw_schemas[:5],  # fix #41: limita a 5 per evitare memory bloat
         },
+        # ── meta ─────────────────────────────────────────────────────────────
         "meta_tags": {
             "has_title": result.meta.has_title,
             "has_description": result.meta.has_description,
@@ -1132,6 +1575,7 @@ def _audit_result_to_dict(result) -> dict:
             "title_length": result.meta.title_length,
             "canonical_url": result.meta.canonical_url,
         },
+        # ── content ──────────────────────────────────────────────────────────
         "content": {
             "has_h1": result.content.has_h1,
             "heading_count": result.content.heading_count,
@@ -1145,6 +1589,24 @@ def _audit_result_to_dict(result) -> dict:
             "has_heading_hierarchy": result.content.has_heading_hierarchy,
             "has_lists_or_tables": result.content.has_lists_or_tables,
             "has_front_loading": result.content.has_front_loading,
+        },
+        # ── signals (previously missing from checks) ──────────────────────
+        "signals": {
+            "has_lang": result.signals.has_lang if result.signals else False,
+            "has_rss": result.signals.has_rss if result.signals else False,
+            "has_freshness": result.signals.has_freshness if result.signals else False,
+        },
+        # ── ai_discovery (previously missing from checks) ─────────────────
+        "ai_discovery": {
+            "has_well_known_ai": result.ai_discovery.has_well_known_ai if result.ai_discovery else False,
+            "has_summary": result.ai_discovery.has_summary if result.ai_discovery else False,
+            "has_faq": result.ai_discovery.has_faq if result.ai_discovery else False,
+            "endpoints_found": result.ai_discovery.endpoints_found if result.ai_discovery else 0,
+        },
+        # ── brand_entity (previously missing from checks) ─────────────────
+        "brand_entity": {
+            "brand_name_consistent": result.brand_entity.brand_name_consistent if result.brand_entity else False,
+            "kg_pillar_count": result.brand_entity.kg_pillar_count if result.brand_entity else 0,
         },
     }
 
@@ -1448,112 +1910,134 @@ def _dict_to_audit_result(data: dict):
 # ─── GEO Optimization endpoints ──────────────────────────────────────────────
 
 
-@app.get("/robots.txt")
-async def robots_txt():
-    """Serve robots.txt ottimizzato per AI crawler."""
-    from fastapi.responses import PlainTextResponse
+# @app.get("/robots.txt")
+# async def robots_txt():
+#     """Serve robots.txt ottimizzato per AI crawler."""
+#     from fastapi.responses import PlainTextResponse
+#
+#     robots = (
+#         "# GEO Optimizer — robots.txt\n"
+#         "User-agent: *\nAllow: /\n\n"
+#         "User-agent: GPTBot\nAllow: /\n"
+#         "User-agent: OAI-SearchBot\nAllow: /\n"
+#         "User-agent: ChatGPT-User\nAllow: /\n"
+#         "User-agent: ClaudeBot\nAllow: /\n"
+#         "User-agent: Claude-SearchBot\nAllow: /\n"
+#         "User-agent: anthropic-ai\nAllow: /\n"
+#         "User-agent: claude-web\nAllow: /\n"
+#         "User-agent: PerplexityBot\nAllow: /\n"
+#         "User-agent: Perplexity-User\nAllow: /\n"
+#         "User-agent: Google-Extended\nAllow: /\n"
+#         "User-agent: Google-CloudVertexBot\nAllow: /\n"
+#         "User-agent: Bingbot\nAllow: /\n"
+#         "User-agent: Applebot-Extended\nAllow: /\n"
+#         "User-agent: Applebot\nAllow: /\n"
+#         "User-agent: DuckAssistBot\nAllow: /\n"
+#         "User-agent: cohere-ai\nAllow: /\n"
+#         "User-agent: Bytespider\nAllow: /\n"
+#         "User-agent: meta-externalagent\nAllow: /\n"
+#         "User-agent: Meta-ExternalFetcher\nAllow: /\n"
+#         "User-agent: facebookexternalhit\nAllow: /\n"
+#         "User-agent: Amazonbot\nAllow: /\n"
+#         "User-agent: AI2Bot\nAllow: /\n"
+#         "User-agent: AI2Bot-Dolma\nAllow: /\n"
+#         "User-agent: xAI-Bot\nAllow: /\n"
+#         "User-agent: PetalBot\nAllow: /\n"
+#         "User-agent: YouBot\nAllow: /\n"
+#         "User-agent: CCBot\nAllow: /\n"
+#     )
+#     return PlainTextResponse(content=robots, media_type="text/plain")
 
-    robots = (
-        "# GEO Optimizer — robots.txt\n"
-        "User-agent: *\nAllow: /\n\n"
-        "User-agent: GPTBot\nAllow: /\n"
-        "User-agent: OAI-SearchBot\nAllow: /\n"
-        "User-agent: ChatGPT-User\nAllow: /\n"
-        "User-agent: ClaudeBot\nAllow: /\n"
-        "User-agent: Claude-SearchBot\nAllow: /\n"
-        "User-agent: anthropic-ai\nAllow: /\n"
-        "User-agent: claude-web\nAllow: /\n"
-        "User-agent: PerplexityBot\nAllow: /\n"
-        "User-agent: Perplexity-User\nAllow: /\n"
-        "User-agent: Google-Extended\nAllow: /\n"
-        "User-agent: Google-CloudVertexBot\nAllow: /\n"
-        "User-agent: Bingbot\nAllow: /\n"
-        "User-agent: Applebot-Extended\nAllow: /\n"
-        "User-agent: Applebot\nAllow: /\n"
-        "User-agent: DuckAssistBot\nAllow: /\n"
-        "User-agent: cohere-ai\nAllow: /\n"
-        "User-agent: Bytespider\nAllow: /\n"
-        "User-agent: meta-externalagent\nAllow: /\n"
-        "User-agent: Meta-ExternalFetcher\nAllow: /\n"
-        "User-agent: facebookexternalhit\nAllow: /\n"
-        "User-agent: Amazonbot\nAllow: /\n"
-        "User-agent: AI2Bot\nAllow: /\n"
-        "User-agent: AI2Bot-Dolma\nAllow: /\n"
-        "User-agent: xAI-Bot\nAllow: /\n"
-        "User-agent: PetalBot\nAllow: /\n"
-        "User-agent: YouBot\nAllow: /\n"
-        "User-agent: CCBot\nAllow: /\n"
-    )
-    return PlainTextResponse(content=robots, media_type="text/plain")
-
-
-@app.get("/llms.txt")
-async def llms_txt():
-    """Serve llms.txt per AI content discovery."""
-    from fastapi.responses import PlainTextResponse
-
-    llms = (
-        "# GEO Optimizer\n\n"
-        "> Open-source toolkit to audit, fix, and optimize any website for AI search engine visibility.\n"
-        "> Scores 0-100 across 8 categories and 47 research-backed methods.\n"
-        "> Based on Princeton KDD 2024 and AutoGEO ICLR 2026 peer-reviewed research.\n"
-        "> MIT License. Free for commercial and personal use.\n\n"
-        "## What GEO Optimizer Does\n\n"
-        "GEO Optimizer audits any publicly accessible URL — regardless of CMS, framework, or hosting — "
-        "and measures how visible that site is to AI search engines like ChatGPT, Perplexity, Claude, and Gemini.\n\n"
-        "The audit covers 8 categories:\n"
-        "1. robots.txt (18pt) — AI bot access configuration for OAI-SearchBot, ClaudeBot, PerplexityBot\n"
-        "2. llms.txt (18pt) — Machine-readable site index for AI agents, depth-graduated scoring\n"
-        "3. Schema JSON-LD (16pt) — Structured data: FAQPage, Article, Organization, WebSite, sameAs\n"
-        "4. Meta Tags (14pt) — Title, description, canonical, Open Graph\n"
-        "5. Content Quality (12pt) — Statistics, citations, headings, word count, front-loading\n"
-        "6. Technical Signals (6pt) — Language, RSS feed, freshness indicators\n"
-        "7. AI Discovery (6pt) — well-known/ai.txt, /ai/summary.json, /ai/faq.json, /ai/service.json\n"
-        "8. Brand & Entity Signals (10pt) — Knowledge graph, sameAs, About/Contact, geographic identity\n\n"
-        "Score bands: 86-100 Excellent | 68-85 Good | 36-67 Foundation | 0-35 Critical\n\n"
-        "## Tools\n\n"
-        "- [GEO Audit Web](https://geo-optimizer-web.onrender.com/): Audit any URL — score 0-100 with breakdown\n"
-        "- [Compare](https://geo-optimizer-web.onrender.com/compare): Side-by-side GEO score comparison of two URLs\n"
-        "- [Badge](https://geo-optimizer-web.onrender.com/badge?url=https://example.com): Dynamic SVG GEO score badge\n"
-        "- [Manifesto](https://geo-optimizer-web.onrender.com/manifesto): Why AI search visibility should be open\n"
-        "- [Research](https://geo-optimizer-web.onrender.com/research): Scientific papers behind the scoring\n"
-        "- [Roadmap](https://geo-optimizer-web.onrender.com/roadmap): Upcoming features and milestones\n\n"
-        "## CLI Install\n\n"
-        "```\n"
-        "pip install geo-optimizer-skill\n"
-        "geo audit --url https://example.com\n"
-        "geo audit --url https://example.com --format rich\n"
-        "geo audit --url https://example.com --format json\n"
-        "geo fix --url https://example.com --only robots,llms,schema\n"
-        "```\n\n"
-        "## Integrations\n\n"
-        "- CLI: `geo` command — 7 output formats (text, rich, json, html, pdf, github, ci)\n"
-        "- GitHub Actions: `geo-action` — CI/CD integration with SARIF and JUnit output\n"
-        "- MCP Server: `geo-mcp` — Tool server for Claude, Cursor, Windsurf, Continue\n"
-        "- Python API: `from geo_optimizer import run_full_audit` — programmatic access\n"
-        "- Plugin system: Custom checks via `CheckRegistry` — extend without forking\n\n"
-        "## Documentation\n\n"
-        "- [Getting Started](https://auriti-labs.github.io/geo-optimizer-skill/getting-started/): Install and first audit\n"
-        "- [GEO Audit](https://auriti-labs.github.io/geo-optimizer-skill/geo-audit/): Full CLI reference\n"
-        "- [Scoring Rubric](https://auriti-labs.github.io/geo-optimizer-skill/scoring-rubric/): All 8 categories explained\n"
-        "- [MCP Server](https://auriti-labs.github.io/geo-optimizer-skill/mcp-server/): AI agent integration\n"
-        "- [CI/CD](https://auriti-labs.github.io/geo-optimizer-skill/ci-cd/): GitHub Actions integration\n"
-        "- [GEO Methods](https://auriti-labs.github.io/geo-optimizer-skill/geo-methods/): 47 research-backed methods\n\n"
-        "## Reference\n\n"
-        "- [AI Bots Reference](https://auriti-labs.github.io/geo-optimizer-skill/ai-bots-reference/): 27 AI crawlers documented\n"
-        "- [Troubleshooting](https://auriti-labs.github.io/geo-optimizer-skill/troubleshooting/): Common issues\n"
-        "- [Changelog](https://github.com/Auriti-Labs/geo-optimizer-skill/blob/main/CHANGELOG.md): Full release history\n"
-        "- [PyPI](https://pypi.org/project/geo-optimizer-skill/): Package and version history\n\n"
-        "## Research Foundation\n\n"
-        "- GEO: Generative Engine Optimization — Princeton NLP, KDD 2024 — https://arxiv.org/abs/2311.09735\n"
-        "- AutoGEO: Automatic GEO — Carnegie Mellon, ICLR 2026 — https://arxiv.org/abs/2510.11438\n"
-        "- llms.txt specification — Answer.AI — https://llmstxt.org/\n"
-        "- geo-checklist.dev standard — https://geo-checklist.dev/\n\n"
-        "## Optional\n\n"
-        "- [GitHub Issues](https://github.com/Auriti-Labs/geo-optimizer-skill/issues): Bug reports and feature requests\n"
-        "- [Releases RSS](https://github.com/Auriti-Labs/geo-optimizer-skill/releases.atom): Subscribe to new releases\n"
-    )
-    return PlainTextResponse(content=llms, media_type="text/plain")
+# @app.get("/llms.txt")
+# async def llms_txt():
+#     """Serve llms.txt per AI content discovery."""
+#     from fastapi.responses import PlainTextResponse
+#
+#     llms = (
+#         "# GEO Optimizer\n\n"
+#         "> Open-source toolkit to audit, fix, and optimize any website for AI search engine visibility.\n"
+#         "> Scores 0-100 across 8 categories and 47 research-backed methods.\n"
+#         "> Based on Princeton KDD 2024 and AutoGEO ICLR 2026 peer-reviewed research.\n"
+#         "> MIT License. Free for commercial and personal use.\n\n"
+#         "## What GEO Optimizer Does\n\n"
+#         "GEO Optimizer audits any publicly accessible URL — regardless of CMS, framework, or hosting — "
+#         "and measures how visible that site is to AI search engines like ChatGPT, Perplexity, Claude, and Gemini.\n\n"
+#         "The audit covers 8 categories:\n"
+#         "1. robots.txt (18pt) — AI bot access configuration for OAI-SearchBot, ClaudeBot, PerplexityBot\n"
+#         "2. llms.txt (18pt) — Machine-readable site index for AI agents, depth-graduated scoring\n"
+#         "3. Schema JSON-LD (16pt) — Structured data: FAQPage, Article, Organization, WebSite, sameAs\n"
+#         "4. Meta Tags (14pt) — Title, description, canonical, Open Graph\n"
+#         "5. Content Quality (12pt) — Statistics, citations, headings, word count, front-loading\n"
+#         "6. Technical Signals (6pt) — Language, RSS feed, freshness indicators\n"
+#         "7. AI Discovery (6pt) — well-known/ai.txt, /ai/summary.json, /ai/faq.json, /ai/service.json\n"
+#         "8. Brand & Entity Signals (10pt) — Knowledge graph, sameAs, About/Contact, geographic identity\n\n"
+#         "Score bands: 86-100 Excellent | 68-85 Good | 36-67 Foundation | 0-35 Critical\n\n"
+#         "## Tools\n\n"
+#         "- [GEO Audit Web](https://geoready.dev/): Audit any URL — score 0-100 with breakdown\n"
+#         "- [Compare](https://geoready.dev/compare): Side-by-side GEO score comparison of two URLs\n"
+#         "- [Badge](https://geoready.dev/badge?url=https://example.com): Dynamic SVG GEO score badge\n"
+#         "- [Manifesto](https://geoready.dev/manifesto): Why AI search visibility should be open\n"
+#         "- [Research](https://geoready.dev/research): Scientific papers behind the scoring\n"
+#         "- [Roadmap](https://geoready.dev/roadmap): Upcoming features and milestones\n\n"
+#         "## CLI Install\n\n"
+#         "```\n"
+#         "pip install geo-optimizer-skill\n"
+#         "geo audit --url https://example.com\n"
+#         "geo audit --url https://example.com --format rich\n"
+#         "geo audit --url https://example.com --format json\n"
+#         "geo fix --url https://example.com --only robots,llms,schema\n"
+#         "```\n\n"
+#         "## Integrations\n\n"
+#         "- CLI: `geo` command — 7 output formats (text, rich, json, html, pdf, github, ci)\n"
+#         "- GitHub Actions: `geo-action` — CI/CD integration with SARIF and JUnit output\n"
+#         "- MCP Server: `geo-mcp` — Tool server for Claude, Cursor, Windsurf, Continue\n"
+#         "- Python API: `from geo_optimizer import run_full_audit` — programmatic access\n"
+#         "- Plugin system: Custom checks via `CheckRegistry` — extend without forking\n\n"
+#         "## Documentation\n\n"
+#         "- [Getting Started]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/getting-started/): "
+#         "Install and first audit\n"
+#         "- [GEO Audit]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/geo-audit/): "
+#         "Full CLI reference\n"
+#         "- [Scoring Rubric]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/scoring-rubric/): "
+#         "All 8 categories explained\n"
+#         "- [MCP Server]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/mcp-server/): "
+#         "AI agent integration\n"
+#         "- [CI/CD]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/ci-cd/): "
+#         "GitHub Actions integration\n"
+#         "- [GEO Methods]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/geo-methods/): "
+#         "47 research-backed methods\n\n"
+#         "## Reference\n\n"
+#         "- [AI Bots Reference]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/"
+#         "ai-bots-reference/): 27 AI crawlers documented\n"
+#         "- [Troubleshooting]"
+#         "(https://auriti-labs.github.io/geo-optimizer-skill/troubleshooting/): "
+#         "Common issues\n"
+#         "- [Changelog]"
+#         "(https://github.com/Auriti-Labs/geo-optimizer-skill/blob/main/CHANGELOG.md): "
+#         "Full release history\n"
+#         "- [PyPI](https://pypi.org/project/geo-optimizer-skill/): "
+#         "Package and version history\n\n"
+#         "## Research Foundation\n\n"
+#         "- GEO: Generative Engine Optimization — Princeton NLP, KDD 2024 — https://arxiv.org/abs/2311.09735\n"
+#         "- AutoGEO: Automatic GEO — Carnegie Mellon, ICLR 2026 — https://arxiv.org/abs/2510.11438\n"
+#         "- llms.txt specification — Answer.AI — https://llmstxt.org/\n"
+#         "- geo-checklist.dev standard — https://geo-checklist.dev/\n\n"
+#         "## Optional\n\n"
+#         "- [GitHub Issues]"
+#         "(https://github.com/Auriti-Labs/geo-optimizer-skill/issues): "
+#         "Bug reports and feature requests\n"
+#         "- [Releases RSS]"
+#         "(https://github.com/Auriti-Labs/geo-optimizer-skill/releases.atom): "
+#         "Subscribe to new releases\n"
+#     )
+#     return PlainTextResponse(content=llms, media_type="text/plain")
 
 
 @app.get("/.well-known/ai.txt")
@@ -1572,8 +2056,12 @@ async def ai_summary():
     """Site summary for AI systems."""
     return {
         "name": "GEO Optimizer",
-        "description": "Open-source toolkit to audit and optimize websites for AI search engine visibility. Scores 0-100 based on 47 research-backed methods.",
-        "url": "https://geo-optimizer-web.onrender.com",
+        "description": (
+            "Open-source toolkit to audit and optimize websites for AI"
+            " search engine visibility. Scores 0-100 based on 47"
+            " research-backed methods."
+        ),
+        "url": "https://geoready.dev",
         "lastModified": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     }
 
@@ -1585,11 +2073,20 @@ async def ai_faq():
         "faqs": [
             {
                 "question": "What is GEO Optimizer?",
-                "answer": "An open-source toolkit that audits websites for AI search visibility, scoring 0-100 based on 47 research-backed methods.",
+                "answer": (
+                    "An open-source toolkit that audits websites for AI"
+                    " search visibility, scoring 0-100 based on 47"
+                    " research-backed methods."
+                ),
             },
             {
                 "question": "How is the score calculated?",
-                "answer": "Across 8 categories: robots.txt (18pt), llms.txt (18pt), schema (16pt), meta (14pt), content (12pt), signals (6pt), AI discovery (6pt), brand & entity (10pt).",
+                "answer": (
+                    "Across 8 categories: robots.txt (18pt),"
+                    " llms.txt (18pt), schema (16pt), meta (14pt),"
+                    " content (12pt), signals (6pt), AI discovery (6pt),"
+                    " brand & entity (10pt)."
+                ),
             },
             {"question": "Is it free?", "answer": "Yes, MIT License. Install: pip install geo-optimizer-skill"},
         ]
@@ -1611,6 +2108,7 @@ def _render_homepage(nonce: str = "") -> str:
     Fix #89: HTML moved to templates/index.html instead of being inline.
     Fix #75: accepts the CSP nonce and replaces the __NONCE_ATTR__ placeholder.
     The template uses '__NONCE_ATTR__' as a placeholder in the <script> tag attribute.
+    Fix #GDPR: cookie banner integration - the banner is now inline in index.html.
     """
     template_path = Path(__file__).parent / "templates" / "index.html"
     html = template_path.read_text(encoding="utf-8")
@@ -1619,3 +2117,308 @@ def _render_homepage(nonce: str = "") -> str:
     # Without nonce: "<script__NONCE_ATTR__>" → "<script>"
     nonce_attr = f' nonce="{nonce}"' if nonce else ""
     return html.replace("__NONCE_ATTR__", nonce_attr)
+
+
+# ─── Competitive Narrative Analysis API ───────────────────────────────────────
+
+
+class CompetitorRequest(BaseModel):
+    """Schema per la richiesta di competitive narrative analysis."""
+
+    target_url: str
+    competitor_urls: list[str]
+
+
+@app.post("/api/analyze-competitors")
+async def analyze_competitors(request: Request, body: CompetitorRequest):
+    """Analisi competitiva narrativa: come LLM descrivono i competitor.
+
+    Esegue audit su target e competitor, poi usa LLM per estrarre:
+    - Adjectives dominanti (es. "enterprise", "budget", "premium")
+    - Key frames (es. "AI-first", "developer-friendly")
+    - Positioning statement
+    - Segnali di credibilità
+    - Content gaps
+
+    Poi confronta target vs competitor e genera azioni concrete.
+
+    Fix #382: Competitive Narrative Analysis
+    """
+    from geo_optimizer.utils.validators import validate_public_url
+
+    # Verify Bearer token
+    if not _verify_bearer_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Rate limit
+    if not await _check_rate_limit(_get_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again soon.")
+
+    # URL validation
+    target_url, error = _normalize_url(body.target_url)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    safe, reason = validate_public_url(target_url)
+    if not safe:
+        raise HTTPException(status_code=400, detail=f"Invalid target URL: {reason}")
+
+    # Validate competitor URLs
+    valid_competitors = []
+    for url in body.competitor_urls:
+        normalized, err = _normalize_url(url)
+        if not err:
+            competitor_safe, reason = validate_public_url(normalized)
+            if competitor_safe:
+                valid_competitors.append(normalized)
+            else:
+                logger.warning("Skipping invalid competitor URL: %s - %s", url, reason)
+        else:
+            logger.warning("Skipping invalid competitor URL format: %s", url)
+
+    if not valid_competitors:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid competitor URLs provided. Please enter at least one valid competitor URL.",
+        )
+
+    # Run competitive narrative analysis
+    try:
+        from geo_optimizer.core.competitive_narrative import run_competitive_narrative_analysis
+
+        result = await asyncio.to_thread(
+            run_competitive_narrative_analysis,
+            target_url=target_url,
+            competitor_urls=valid_competitors,
+        )
+    except Exception as exc:
+        logger.error("Competitive narrative analysis error: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error during competitive analysis. Try again later.",
+        ) from exc
+
+    # Format response
+    from geo_optimizer.core.competitive_narrative import format_competitive_narrative
+
+    response_data = format_competitive_narrative(result)
+    response_data["competitor_count"] = len(valid_competitors)
+
+    return JSONResponse(content=response_data)
+
+
+@app.get("/api/analyze-competitors")
+async def analyze_competitors_get(
+    request: Request,
+    target_url: str = Query(..., description="Target website URL"),
+    competitor_urls: str = Query(..., description="Competitor URLs, comma-separated"),
+):
+    """Analisi competitiva narrativa via GET (query params).
+
+    Usage:
+        /api/analyze-competitors?target=https://example.com&competitors=https://a.com,https://b.com
+    """
+    # Verify Bearer token
+    if not _verify_bearer_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Rate limit
+    if not await _check_rate_limit(_get_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again soon.")
+
+    # Parse competitor URLs from comma-separated string
+    competitors_list = [u.strip() for u in competitor_urls.split(",") if u.strip()]
+
+    if not competitors_list:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one competitor URL is required.",
+        )
+
+    # Build request and call POST handler
+    # Re-use POST handler via direct call
+    body = CompetitorRequest(target_url=target_url, competitor_urls=competitors_list)
+    return await analyze_competitors(request, body)
+
+
+# ─── Gap analysis endpoint per confronto semplificato ─────────────────────────
+
+
+class GapAnalysisRequest(BaseModel):
+    """Schema per gap analysis tra due URL."""
+
+    url1: str
+    url2: str
+
+
+@app.post("/api/gap-analysis")
+async def gap_analysis(request: Request, body: GapAnalysisRequest):
+    """Confronto semplice tra due URL (gap analysis).
+
+    Fix #382: Competitive Narrative Analysis
+    """
+    # Verify Bearer token
+    if not _verify_bearer_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Rate limit
+    if not await _check_rate_limit(_get_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again soon.")
+
+    # URL validation
+    url1, error = _normalize_url(body.url1)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    url2, error = _normalize_url(body.url2)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    # Anti-SSRF validation
+    safe1, reason1 = validate_public_url(url1)
+    if not safe1:
+        raise HTTPException(status_code=400, detail=f"Invalid URL 1: {reason1}")
+
+    safe2, reason2 = validate_public_url(url2)
+    if not safe2:
+        raise HTTPException(status_code=400, detail=f"Invalid URL 2: {reason2}")
+
+    # Run gap analysis
+    try:
+        from geo_optimizer.core.gap_analysis import run_gap_analysis
+
+        result = await asyncio.to_thread(run_gap_analysis, url1=url1, url2=url2)
+
+        from geo_optimizer.core.audit import run_full_audit
+        from geo_optimizer.core.gap_analysis import build_gap_analysis
+
+        # Full audit for both
+        result1 = await asyncio.to_thread(run_full_audit, url1)
+        result2 = await asyncio.to_thread(run_full_audit, url2)
+        result = build_gap_analysis(result1, result2)
+    except Exception as exc:
+        logger.error("Gap analysis error: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error during gap analysis. Try again later.",
+        ) from exc
+
+    # Format response
+    from geo_optimizer.core.gap_analysis import build_gap_analysis
+
+    response_data = {
+        "weaker_url": result.weaker_url,
+        "stronger_url": result.stronger_url,
+        "weaker_score": result.weaker_score,
+        "stronger_score": result.stronger_score,
+        "score_gap": result.score_gap,
+        "weaker_band": result.weaker_band,
+        "stronger_band": result.stronger_band,
+        "category_deltas": [
+            {
+                "category": c.category,
+                "label": c.label,
+                "before_score": c.before_score,
+                "after_score": c.after_score,
+                "delta": c.delta,
+                "max_score": c.max_score,
+            }
+            for c in result.category_deltas
+        ],
+        "action_plan": [
+            {
+                "category": a.category,
+                "title": a.title,
+                "rationale": a.rationale,
+                "impact_points": a.impact_points,
+                "priority": a.priority,
+                "command": a.command,
+            }
+            for a in result.action_plan
+        ],
+        "summary": f"Weaker site: {result.weaker_url} (score {result.weaker_score}). "
+        f"Stronger site: {result.stronger_url} (score {result.stronger_score}). "
+        f"Gap: {result.score_gap} points. "
+        f"Found {len(result.action_plan)} actionable recommendations.",
+    }
+
+    return JSONResponse(content=response_data)
+
+
+@app.post("/api/logs/analyze")
+async def analyze_logs(request: Request):
+    """Analyze a server log file for AI crawler activity.
+
+    Accepts a multipart file upload (Apache/Nginx combined or JSON lines format).
+    Field name: 'file'. Max 10 MB — enforced by BodySizeLimitMiddleware.
+    Returns LogAnalysisResult as JSON.
+    """
+    import tempfile
+
+    if not _verify_bearer_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        form = await request.form()
+        upload = form.get("file")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Failed to parse multipart form.") from exc
+
+    if upload is None:
+        raise HTTPException(status_code=400, detail="No file uploaded. Send a multipart field named 'file'.")
+
+    try:
+        content = await upload.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file.") from exc
+
+    if len(content) > _MAX_LOG_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large. Limit: {_MAX_LOG_UPLOAD_BYTES} bytes.")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".log") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to create temporary file.") from exc
+
+    try:
+        from geo_optimizer.core.log_analyzer import analyze_log_file
+
+        result = await asyncio.to_thread(analyze_log_file, tmp_path)
+    except Exception as exc:
+        logger.error("Log analysis error: %s", exc)
+        raise HTTPException(status_code=500, detail="Log analysis failed. Check file format.") from exc
+    finally:
+        import os as _os
+
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return JSONResponse(content=dataclasses.asdict(result))
+
+
+# Garantisce il MIME corretto per i woff2 (alcuni ambienti li servono come
+# application/octet-stream, invalidando il <link rel="preload" as="font">).
+mimetypes.add_type("font/woff2", ".woff2")
+
+# Serve il frontend Astro buildato
+app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")

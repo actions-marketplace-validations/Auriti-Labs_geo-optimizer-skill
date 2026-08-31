@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 from bs4 import BeautifulSoup
 
 from geo_optimizer.core.audit import audit_cdn_ai_crawler, audit_js_rendering
-from geo_optimizer.models.results import CdnAiCrawlerResult, JsRenderingResult
-
 
 # ─── JS Rendering Check (#226) ──────────────────────────────────────────────
 
@@ -182,7 +179,8 @@ class TestCdnAiCrawlerCheck:
 
         assert result.checked is True
         assert result.any_blocked is False
-        assert len(result.bot_results) == 3  # GPTBot, ClaudeBot, PerplexityBot
+        # GPTBot, OAI-SearchBot, PerplexityBot, Claude-SearchBot, Googlebot, Applebot
+        assert len(result.bot_results) == 6
 
     @patch("geo_optimizer.utils.validators.resolve_and_validate_url", return_value=(True, None, ["93.184.216.34"]))
     @patch("geo_optimizer.utils.http.create_session_with_retry")
@@ -223,7 +221,7 @@ class TestCdnAiCrawlerCheck:
             resp = MagicMock()
             if "GPTBot" in ua:
                 resp.status_code = 200
-                resp.text = '<html><body>Checking your browser before accessing the site. Please wait... cf-browser-verification Ray ID: abc123</body></html>'
+                resp.text = "<html><body>Checking your browser before accessing the site. Please wait... cf-browser-verification Ray ID: abc123</body></html>"
                 resp.headers = {"cf-ray": "abc123-CDG", "server": "cloudflare"}
             else:
                 resp.status_code = 200
