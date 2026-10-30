@@ -70,11 +70,17 @@ class TestStatusCodeValidation:
         assert result.found is True
 
     @patch("geo_optimizer.core.audit_llms.fetch_url")
-    def test_llms_403_non_parsato(self, mock_fetch):
-        """llms.txt con status 403 non viene trattato come trovato."""
+    def test_llms_403_bloccato_da_cdn(self, mock_fetch):
+        """llms.txt con status 403 viene marcato come bloccato dal CDN/WAF e fa il retry browser-like.
+
+        Il retry con 403 non recupera il file -> found resta False ma blocked_by_cdn e' True.
+        """
         mock_fetch.return_value = (Mock(status_code=403, text="Forbidden"), None)
         result = audit_llms_txt("https://example.com")
         assert result.found is False
+        assert result.blocked_by_cdn is True
+        # retry browser-like eseguito (almeno il fetch iniziale + 1 retry)
+        assert mock_fetch.call_count >= 2
 
     @patch("geo_optimizer.core.audit_llms.fetch_url")
     def test_llms_301_non_parsato(self, mock_fetch):
@@ -239,20 +245,16 @@ class TestSitemapDepthLimit:
         # Non deve nemmeno fare richieste HTTP
         mock_create.assert_not_called()
 
-    @patch("geo_optimizer.core.llms_generator.create_session_with_retry")
-    def test_profondita_zero_funziona(self, mock_create):
+    @patch("geo_optimizer.core.llms_generator.fetch_url")
+    def test_profondita_zero_funziona(self, mock_fetch):
         """Profondità 0 processa normalmente la sitemap."""
         sitemap_xml = """<?xml version="1.0"?>
         <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
             <url><loc>https://example.com/page1</loc></url>
         </urlset>"""
-        mock_session = MagicMock()
         mock_resp = Mock()
-        mock_resp.content = sitemap_xml.encode()
         mock_resp.iter_content = Mock(return_value=[sitemap_xml.encode()])
-        mock_resp.raise_for_status = Mock()
-        mock_session.get.return_value = mock_resp
-        mock_create.return_value = mock_session
+        mock_fetch.return_value = (mock_resp, None)
 
         result = fetch_sitemap("https://example.com/sitemap.xml", _depth=0)
         assert len(result) == 1
@@ -311,38 +313,34 @@ class TestExtractFaqNoMutation:
 class TestSitemapUrlValidation:
     """discover_sitemap valida gli URL sitemap estratti da robots.txt."""
 
-    @patch("geo_optimizer.core.llms_generator.create_session_with_retry")
-    def test_sitemap_stesso_dominio_accettato(self, mock_create):
+    @patch("geo_optimizer.core.llms_generator.fetch_url")
+    def test_sitemap_stesso_dominio_accettato(self, mock_fetch):
         """URL sitemap dello stesso dominio viene accettato."""
         from geo_optimizer.core.llms_generator import discover_sitemap
 
-        mock_session = MagicMock()
         robots_resp = Mock(text="Sitemap: https://example.com/sitemap.xml", status_code=200)
-        head_resp = Mock(status_code=200)
-        mock_session.get.return_value = robots_resp
-        mock_session.head.return_value = head_resp
-        mock_create.return_value = mock_session
+        mock_fetch.return_value = (robots_resp, None)
 
         with patch("geo_optimizer.core.llms_generator.validate_public_url", return_value=(True, None)):
             result = discover_sitemap("https://example.com")
             assert result == "https://example.com/sitemap.xml"
 
-    @patch("geo_optimizer.core.llms_generator.create_session_with_retry")
-    def test_sitemap_dominio_esterno_rifiutato(self, mock_create):
+    @patch("geo_optimizer.core.llms_generator.fetch_url")
+    def test_sitemap_dominio_esterno_rifiutato(self, mock_fetch):
         """URL sitemap di un dominio diverso viene ignorato."""
         from geo_optimizer.core.llms_generator import discover_sitemap
 
-        mock_session = MagicMock()
         robots_resp = Mock(
             text="Sitemap: https://evil.com/malicious-sitemap.xml",
             status_code=200,
         )
-        # Se il sitemap esterno viene rifiutato, deve cadere ai common paths
-        head_resp = Mock(status_code=404)
-        mock_session.get.return_value = robots_resp
-        mock_session.head.return_value = head_resp
-        mock_create.return_value = mock_session
+        # Se il sitemap esterno viene rifiutato, deve cadere ai common paths (tutti 404)
+        mock_fetch.side_effect = lambda url, **_: (
+            robots_resp if url.endswith("/robots.txt") else Mock(status_code=404),
+            None,
+        )
 
         result = discover_sitemap("https://example.com")
-        # Non deve restituire il sitemap maligno
-        assert result != "https://evil.com/malicious-sitemap.xml"
+        # Non deve restituire né scaricare il sitemap maligno
+        assert result is None
+        assert all("evil.com" not in c.args[0] for c in mock_fetch.call_args_list)

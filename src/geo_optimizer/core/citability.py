@@ -5,6 +5,13 @@ Each detect_*() function analyzes one aspect of HTML content and returns
 a MethodScore. No ML dependencies — only regex, HTML tags and structural metrics.
 
 Paper: "GEO: Generative Engine Optimization" (arxiv.org/abs/2311.09735)
+
+About ``MethodScore.impact`` and the "(+N%)" banners below: they are historical labels kept
+for backward compatibility. Only a few trace to a named source (AutoGEO arXiv:2510.11438, a
+preprint; Stanford, Nature Communications 2025; SE Ranking 2025). The Princeton paper states no
+per-method percentage except the 41% in its Table 1 caption; the other Princeton-method values
+were derived here from Table 1 and are unverified. None was re-measured on current engines, and
+none affects the score.
 """
 
 from __future__ import annotations
@@ -21,12 +28,15 @@ from geo_optimizer.models.config import (
     FRESHNESS_FRESH_DAYS,
     FRESHNESS_VERY_FRESH_DAYS,
     FRONT_LOADING_DENSITY_THRESHOLD,
+    KEYWORD_STUFFING_MIN_COUNT,
     KEYWORD_STUFFING_THRESHOLD,
     TTR_THRESHOLD,
     TTR_WINDOW_SIZE,
 )
 from geo_optimizer.models.results import CitabilityResult, MethodScore
-from geo_optimizer.utils.jsonld import iter_jsonld_objects
+from geo_optimizer.utils.jsonld import first_object, iter_jsonld_objects, string_list
+from geo_optimizer.utils.jsonld import schema_types as jsonld_types
+from geo_optimizer.utils.stopwords import ALL_STOP_WORDS, brand_words, page_language, stop_words_for
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -104,59 +114,6 @@ _TECH_PATTERNS = [
     r"`[^`]+`",
 ]
 _TECH_RE = re.compile("|".join(_TECH_PATTERNS))
-
-# Stop words for TTR (basic English)
-_STOP_WORDS = {
-    "the",
-    "a",
-    "an",
-    "and",
-    "or",
-    "but",
-    "in",
-    "on",
-    "at",
-    "to",
-    "for",
-    "of",
-    "with",
-    "by",
-    "from",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "have",
-    "has",
-    "had",
-    "do",
-    "does",
-    "did",
-    "will",
-    "would",
-    "could",
-    "should",
-    "may",
-    "might",
-    "shall",
-    "this",
-    "that",
-    "these",
-    "those",
-    "it",
-    "its",
-    "not",
-    "no",
-    "can",
-    "so",
-    "if",
-    "then",
-    "than",
-    "also",
-}
-
 
 # ─── Helper function ─────────────────────────────────────────────────────────
 
@@ -539,7 +496,8 @@ def detect_easy_to_understand(soup) -> MethodScore:
 def detect_unique_words(soup, clean_text: str | None = None) -> MethodScore:
     """Calculate Type-Token Ratio to estimate vocabulary richness."""
     body_text = (clean_text or _get_clean_text(soup)).lower()
-    words = [w for w in re.findall(r"\b[a-zA-Zà-ú]{4,}\b", body_text) if w not in _STOP_WORDS]
+    stop_words = stop_words_for(page_language(soup)) or ALL_STOP_WORDS
+    words = [w for w in re.findall(r"\b[^\W\d_]{4,}\b", body_text) if w not in stop_words]
 
     if len(words) < 50:
         return MethodScore(name="unique_words", label="Unique Words", max_score=3, impact="+7%")
@@ -577,9 +535,11 @@ def detect_unique_words(soup, clean_text: str | None = None) -> MethodScore:
 def detect_keyword_stuffing(soup, clean_text: str | None = None) -> MethodScore:
     """Detect keyword stuffing that penalizes AI visibility."""
     body_text = (clean_text or _get_clean_text(soup)).lower()
-    words = re.findall(r"\b[a-zA-Zà-ú]{3,}\b", body_text)
+    words = re.findall(r"\b[^\W\d_]{3,}\b", body_text)
+    # Own brand and function words are not keywords (#607); an unlisted declared language skips the check
+    stop_words = stop_words_for(page_language(soup))
 
-    if len(words) < 50:
+    if stop_words is None or len(words) < 50:
         # Text too short for meaningful analysis
         return MethodScore(
             name="keyword_stuffing", label="No Keyword Stuffing", score=6, max_score=6, impact="-9%", detected=False
@@ -590,7 +550,12 @@ def detect_keyword_stuffing(soup, clean_text: str | None = None) -> MethodScore:
     threshold = KEYWORD_STUFFING_THRESHOLD
 
     # Words with abnormal frequency (above threshold)
-    suspicious = {w: c for w, c in word_freq.most_common(20) if c / total > threshold and w not in _STOP_WORDS}
+    stop_words = stop_words | brand_words(soup)
+    suspicious = {
+        w: c
+        for w, c in word_freq.most_common(20)
+        if c / total > threshold and c >= KEYWORD_STUFFING_MIN_COUNT and w not in stop_words
+    }
 
     stuffing_count = len(suspicious)
 
@@ -609,7 +574,7 @@ def detect_keyword_stuffing(soup, clean_text: str | None = None) -> MethodScore:
         front_suspicious = {
             w: c
             for w, c in front_freq.most_common(10)
-            if c / front_total > FRONT_LOADING_DENSITY_THRESHOLD and w not in _STOP_WORDS
+            if c / front_total > FRONT_LOADING_DENSITY_THRESHOLD and w not in stop_words
         }
         if len(front_suspicious) >= 2:
             front_loading_warning = True
@@ -650,7 +615,7 @@ def detect_keyword_stuffing(soup, clean_text: str | None = None) -> MethodScore:
     )
 
 
-# ─── 10. Answer-First Structure (+25%) — AutoGEO ICLR 2026 ───────────────────
+# ─── 10. Answer-First Structure (+25%) — AutoGEO (arXiv:2510.11438, preprint) ───────────────────
 
 
 # Pattern for concrete facts: numbers, percentages, assertive statements
@@ -667,7 +632,7 @@ _FACT_RE = re.compile(
 def detect_answer_first(soup) -> MethodScore:
     """Detect answer-first structure: H2 followed by paragraph with concrete fact.
 
-    AutoGEO (ICLR 2026) identifies AnswerFirst as one of the most effective
+    AutoGEO (arXiv:2510.11438, preprint) identifies AnswerFirst as one of the most effective
     strategies for AI citation. For each H2, checks if the first paragraph
     contains a concrete fact (number, assertive statement) in the first 150 chars.
     """
@@ -984,7 +949,7 @@ def detect_image_alt_quality(soup) -> MethodScore:
 def _compute_freshness_level(days_old: float) -> str:
     """Map content age in days to a freshness level string (#401).
 
-    Levels (AutoGEO ICLR 2026):
+    Levels (AutoGEO, arXiv:2510.11438 preprint):
     - very_fresh: < 3 months (FRESHNESS_VERY_FRESH_DAYS)
     - fresh:      3-6 months (FRESHNESS_FRESH_DAYS)
     - aging:      6-12 months (FRESHNESS_AGING_DAYS)
@@ -1485,9 +1450,7 @@ def detect_comparison_content(soup, clean_text: str | None = None) -> MethodScor
 def _extract_article_author(soup) -> dict | None:
     """Return the `author` value of the first Article-type JSON-LD schema found, if any."""
     for item in iter_jsonld_objects(soup):
-        item_type = item.get("@type")
-        types = item_type if isinstance(item_type, list) else [item_type]
-        if any(t in ARTICLE_TYPES for t in types):
+        if any(t in ARTICLE_TYPES for t in jsonld_types(item.get("@type"))):
             author = item.get("author")
             if isinstance(author, list):
                 author = author[0] if author else None
@@ -2052,22 +2015,20 @@ def detect_shopping_readiness(soup) -> MethodScore:
 
     score = 0
     # Verify price + availability in the offer
-    offers = product_schema.get("offers") or product_schema.get("offer", {})
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
+    offers = first_object(product_schema.get("offers") or product_schema.get("offer"))
     has_price = bool(offers.get("price") or offers.get("lowPrice"))
     has_availability = bool(offers.get("availability"))
 
     if has_price and has_availability:
         score += 1
 
-    # AggregateRating
-    has_rating = bool(product_schema.get("aggregateRating"))
+    # AggregateRating (solo se e' un oggetto: una stringa come "4.5" non e' un rating strutturato)
+    rating_data = first_object(product_schema.get("aggregateRating"))
+    has_rating = bool(rating_data)
     if has_rating:
         score += 1
 
     # Review count
-    rating_data = product_schema.get("aggregateRating", {})
     has_review_count = bool(rating_data.get("reviewCount") or rating_data.get("ratingCount"))
     if has_review_count:
         score += 1
@@ -2124,9 +2085,7 @@ def detect_chatgpt_shopping(soup) -> MethodScore:
     has_image = bool(product_schema.get("image"))
     has_brand = bool(product_schema.get("brand"))
 
-    offers = product_schema.get("offers") or product_schema.get("offer", {})
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
+    offers = first_object(product_schema.get("offers") or product_schema.get("offer"))
     has_price = bool(offers.get("price") or offers.get("lowPrice"))
     has_availability = bool(offers.get("availability"))
 
@@ -2257,12 +2216,7 @@ def detect_multi_platform(soup) -> MethodScore:
 
     # Extract sameAs from all JSON-LD schemas
     for item in _iter_jsonld_objects(soup):
-        same_as = item.get("sameAs", [])
-        if isinstance(same_as, str):
-            same_as = [same_as]
-        for url in same_as:
-            if not isinstance(url, str):
-                continue
+        for url in string_list(item.get("sameAs")):
             parsed = urlparse(url)
             domain = parsed.netloc.lower().removeprefix("www.")
             for plat_domain, plat_name in _PLATFORM_DOMAINS.items():
@@ -2293,56 +2247,100 @@ def detect_multi_platform(soup) -> MethodScore:
 
 # ─── Entity Disambiguation (+8%) — Batch A v3.16.0 ───────────────────────────
 
+# Trattino solo se spaziato: "Coca-Cola" è un nome, "Acme - Home" è un separatore
+_TITLE_SEPARATOR_RE = re.compile(r"\s+-\s+|\s*[|–—·]\s*")
+
+
+def _split_title_segments(raw: str) -> list[str]:
+    """Split a title into its lowercased segments, dropping empties."""
+    return [seg.strip().lower() for seg in _TITLE_SEPARATOR_RE.split(raw.strip()) if seg.strip()]
+
+
+def _names_are_consistent(title_segments: set[str], schema_names: list[str]) -> bool:
+    """Whether the entity is named the same way across title, og:title and schema.
+
+    With a schema name available, a single one of them matching any title segment is
+    enough: a page titled "Free Audit — Brand" whose graph names the organization is
+    consistent, not contradictory. Matching allows containment in either direction so
+    that "brand" still resolves against "brand pricing".
+
+    Without a schema name there is nothing to anchor to, so the title surfaces
+    themselves must agree.
+    """
+    if not schema_names:
+        return len(title_segments) == 1 if title_segments else False
+    if not title_segments:
+        return False
+    return any(
+        schema_name == segment or schema_name in segment or segment in schema_name
+        for schema_name in schema_names
+        for segment in title_segments
+    )
+
 
 def detect_entity_disambiguation(soup) -> MethodScore:
     """Detect entity disambiguation signals: consistent naming and explicit definitions."""
     score = 0
 
     # 1. Collect names from title, og:title, schema name
+    #
+    # gap #4.16.5: this used to keep only the segment *before* the first separator, so a
+    # title that ends with the brand — "Some Page Title — Brand", the most common
+    # convention — never exposed the brand at all, and the schema name could not match
+    # anything. Keep every segment instead and let the comparison below decide.
     names: list[str] = []
     title_tag = soup.find("title")
     if title_tag and title_tag.string:
-        # Take the part before common separators
-        raw = title_tag.string.strip()
-        parts = re.split(r"\s*[|\-–—]\s*", raw)
-        if parts:
-            names.append(parts[0].strip().lower())
+        names.extend(_split_title_segments(title_tag.string))
 
     og_title = soup.find("meta", attrs={"property": "og:title"})
     if og_title and og_title.get("content"):
-        parts = re.split(r"\s*[|\-–—]\s*", og_title["content"])
-        if parts:
-            names.append(parts[0].strip().lower())
+        names.extend(_split_title_segments(og_title["content"]))
 
-    # Name from JSON-LD schema
-    schema_name = None
+    title_segments = set(names)
+
+    # Names from JSON-LD schema.
+    #
+    # gap #4.16.5: the loop stopped at the first `name` it met, which on an @graph is
+    # whichever entity the CMS happens to emit first (often Organization). A site whose
+    # title carries the product name while the graph opens with the company name looked
+    # inconsistent. Collect every name, and sum sameAs across entities instead of taking
+    # the largest single list — the links disambiguate the site as a whole.
+    schema_names: list[str] = []
     sameas_count = 0
     for item in _iter_jsonld_objects(soup):
-        if "name" in item and not schema_name:
+        if "name" in item:
             schema_name = str(item["name"]).strip().lower()
-            names.append(schema_name)
+            if schema_name:
+                schema_names.append(schema_name)
+                names.append(schema_name)
         same_as = item.get("sameAs", [])
         if isinstance(same_as, str):
             same_as = [same_as]
         if isinstance(same_as, list):
-            sameas_count = max(sameas_count, len(same_as))
+            sameas_count += len(same_as)
 
-    # Check consistency: at least 2 names and all matching
-    if len(names) >= 2:
-        unique_names = set(names)
-        if len(unique_names) == 1:
-            score += 1
+    # Check consistency: the entity is named the same way across surfaces. With a schema
+    # name present, one of them matching any title segment is enough; without one, the
+    # title and og:title must agree.
+    names_consistent = _names_are_consistent(title_segments, schema_names)
+    if names_consistent:
+        score += 1
 
     # 2. First sentence contains an explicit definition of the brand/site
-    body = soup.find("body")
-    if body:
-        # Find the first meaningful paragraph
-        first_p = body.find("p")
-        if first_p:
-            first_text = first_p.get_text(strip=True)
+    #
+    # gap #4.16.5: this read the first <p> of the whole body, which on any site with a
+    # nav built out of paragraphs is a menu label ("Pricing — plans from $0"), never the
+    # opening sentence. Scope to the main content the way the other detectors already do,
+    # and scan the first few paragraphs since a hero often leads with a headline blurb.
+    main = soup.find("main") or soup.find("article") or soup.find("body")
+    if main:
+        for paragraph in main.find_all("p", limit=3):
+            text = paragraph.get_text(strip=True)
             # Look for definition pattern: "X is...", "X è..."
-            if re.search(r"\b(?:is|are|è|sono)\s+(?:a|an|the|un|una|il|la|lo)\b", first_text, re.I):
+            if re.search(r"\b(?:is|are|è|sono)\s+(?:a|an|the|un|una|il|la|lo)\b", text, re.I):
                 score += 1
+                break
 
     # 3. sameAs with > 3 links (disambiguation bonus)
     if sameas_count > 3:
@@ -2357,7 +2355,7 @@ def detect_entity_disambiguation(soup) -> MethodScore:
         impact="+8%",
         details={
             "names_found": names,
-            "names_consistent": len(set(names)) <= 1 if names else False,
+            "names_consistent": names_consistent,
             "sameas_count": sameas_count,
         },
     )
@@ -3287,10 +3285,7 @@ def detect_entity_resolution(soup) -> MethodScore:
         desc = item.get("description")
         if entity_type and name:
             has_schema_entity = True
-            if isinstance(entity_type, list):
-                entity_types_found.extend(entity_type)
-            else:
-                entity_types_found.append(str(entity_type))
+            entity_types_found.extend(jsonld_types(entity_type))
             if desc:
                 score += 1  # well-described entity
         # sameAs check (same item may have both @type and sameAs)
@@ -3473,60 +3468,73 @@ def detect_retrieval_triggers(soup, clean_text: str | None = None) -> MethodScor
 
 # ─── Orchestrator ─────────────────────────────────────────────────────────────
 
-# Improvement suggestions for each undetected method
+
+# Improvement suggestions for each undetected method.
+# Only two suggestions keep a figure, with its source and caveat. The other Princeton-method
+# figures were derived from Table 1 and are not stated by the paper per method, so they are omitted.
+_QUOTATION_NOTE = (
+    "(Aggarwal et al. 2023 reported about +41% in position-adjusted visibility for quotation addition "
+    "on its own benchmark; not re-measured on current engines)"
+)
+_STATISTICS_NOTE = (
+    "(Aggarwal et al. 2023 reported about +33% on the word-count metric (about +31% position-adjusted) "
+    "on its own benchmark; not re-measured on current engines)"
+)
+
+
 _IMPROVEMENT_SUGGESTIONS = {
-    "quotation_addition": "Add attributed quotes in <blockquote> (+41% AI visibility)",
-    "statistics_addition": "Include quantitative data: percentages, figures, metrics (+33%)",
-    "fluency_optimization": "Improve fluency with longer paragraphs and logical connectives (+29%)",
-    "cite_sources": "Cite authoritative sources (.edu, .gov, Wikipedia) with external links (+27%)",
-    "answer_first": "Start each section with a concrete fact in the first sentence (+25% AI citation)",
-    "passage_density": "Write self-contained paragraphs of 50-150 words with numeric data (+23%)",
-    "technical_terms": "Use domain-specific technical terminology (+18%)",
-    "authoritative_tone": "Add author bio with credentials and assertive tone (+16%)",
-    "readability": "Target Flesch-Kincaid Grade 6-8 with 100-150 word sections (+15% AI citation)",
-    "citability_density": "Add 2+ citable facts (numbers, names, dates) per paragraph (+15%)",
-    "easy_to_understand": "Improve readability: short sentences, hierarchical headings, FAQ (+14%)",
-    "faq_in_content": "Add FAQ patterns in content: headings ending with '?' followed by answers (+12%)",
-    "content_freshness": "Add dateModified in JSON-LD and reference current year in content (+10%)",
-    "definition_patterns": "Start sections with definitions: 'X is...', 'X refers to...' (+10%)",
-    "image_alt_quality": "Write descriptive alt text (>10 chars, not generic) for all images (+8%)",
-    "format_mix": "Mix content formats: paragraphs + bullet lists + tables (+8%)",
-    "unique_words": "Vary vocabulary: use synonyms, avoid repetitions (+7%)",
-    "keyword_stuffing": "Reduce density of repeated keywords (-9% if present)",
+    "quotation_addition": "Add attributed quotes in <blockquote> " + _QUOTATION_NOTE,
+    "statistics_addition": "Include quantitative data: percentages, figures, metrics " + _STATISTICS_NOTE,
+    "fluency_optimization": "Improve fluency with longer paragraphs and logical connectives",
+    "cite_sources": "Cite authoritative sources (.edu, .gov, Wikipedia) with external links",
+    "answer_first": "Start each section with a concrete fact in the first sentence",
+    "passage_density": "Write self-contained paragraphs of 50-150 words with numeric data",
+    "technical_terms": "Use domain-specific technical terminology",
+    "authoritative_tone": "Add author bio with credentials and assertive tone",
+    "readability": "Target Flesch-Kincaid Grade 6-8 with 100-150 word sections",
+    "citability_density": "Add 2+ citable facts (numbers, names, dates) per paragraph",
+    "easy_to_understand": "Improve readability: short sentences, hierarchical headings, FAQ",
+    "faq_in_content": "Add FAQ patterns in content: headings ending with '?' followed by answers",
+    "content_freshness": "Add dateModified in JSON-LD and reference current year in content",
+    "definition_patterns": "Start sections with definitions: 'X is...', 'X refers to...'",
+    "image_alt_quality": "Write descriptive alt text (>10 chars, not generic) for all images",
+    "format_mix": "Mix content formats: paragraphs + bullet lists + tables",
+    "unique_words": "Vary vocabulary: use synonyms, avoid repetitions",
+    "keyword_stuffing": "Reduce density of repeated keywords",
     # Quality Signals Batch 2
-    "attribution_completeness": "Add inline attributions: 'according to X', 'Y (2024) found that' (+12%)",
-    "no_negative_signals": "Remove excessive CTAs, add author info, avoid repetitive phrases (-15%)",
-    "comparison_content": "Add comparison tables, pro/con sections, or 'X vs Y' headings (+10%)",
-    "eeat_signals": "Add privacy policy, terms, about page, and contact links for E-E-A-T trust (+15%)",
-    "no_content_decay": "Update old year references and add recent dateModified (-10%)",
-    "boilerplate_ratio": "Ensure main content is >60% of page text; use <main> or <article> tags (+8%)",
-    "nuance_signals": "Add nuance: 'however', 'limitations include', 'on the other hand' (+5%)",
+    "attribution_completeness": "Add inline attributions: 'according to X', 'Y (2024) found that'",
+    "no_negative_signals": "Remove excessive CTAs, add author info, avoid repetitive phrases",
+    "comparison_content": "Add comparison tables, pro/con sections, or 'X vs Y' headings",
+    "eeat_signals": "Add privacy policy, terms, about page, and contact links for E-E-A-T trust",
+    "no_content_decay": "Update old year references and add recent dateModified",
+    "boilerplate_ratio": "Ensure main content is >60% of page text; use <main> or <article> tags",
+    "nuance_signals": "Add nuance: 'however', 'limitations include', 'on the other hand'",
     # Quality Signals Batch 3+4
-    "snippet_ready": "Add snippet-ready definitions after headings: 'X is...', 'X refers to...' (+10%)",
-    "chunk_quotability": "Write self-contained paragraphs (50-150 words) with concrete data for AI quoting (+10%)",
-    "blog_structure": "Add Article/BlogPosting schema with datePublished, author, and categories (+8%)",
-    "shopping_readiness": "Add Product schema with price, availability, and AggregateRating (+8%)",
-    "chatgpt_shopping": "Complete Product schema with name, price, image, availability, brand for ChatGPT Shopping (+8%)",
+    "snippet_ready": "Add snippet-ready definitions after headings: 'X is...', 'X refers to...'",
+    "chunk_quotability": "Write self-contained paragraphs (50-150 words) with concrete data for AI quoting",
+    "blog_structure": "Add Article/BlogPosting schema with datePublished, author, and categories",
+    "shopping_readiness": "Add Product schema with price, availability, and AggregateRating",
+    "chatgpt_shopping": "Complete Product schema with name, price, image, availability, brand for ChatGPT Shopping",
     # Quality Signals Batch A v3.16.0
-    "voice_search_ready": "Add question-format headings with concise answers for voice search (+5%)",
-    "multi_platform": "Add 3+ platform links in sameAs schema (GitHub, LinkedIn, Twitter, etc.) (+10%)",
-    "entity_disambiguation": "Use consistent naming across title, og:title, and schema; add explicit definition (+8%)",
-    "first_party_data": "Include original research signals: 'our data shows', methodology section (+12%)",
-    "no_stale_data": "Remove stale year references and update copyright year (-10%)",
-    "social_proof": "Add testimonials, AggregateRating with reviews, or trust badges (+8%)",
-    "accessibility_signals": "Use semantic HTML (<main>, <nav>), ARIA landmarks, and skip links (+5%)",
-    "conversion_funnel": "Add visible CTAs, pricing page link, and contact information (+8%)",
+    "voice_search_ready": "Add question-format headings with concise answers for voice search",
+    "multi_platform": "Add 3+ platform links in sameAs schema (GitHub, LinkedIn, Twitter, etc.)",
+    "entity_disambiguation": "Use consistent naming across title, og:title, and schema; add explicit definition",
+    "first_party_data": "Include original research signals: 'our data shows', methodology section",
+    "no_stale_data": "Remove stale year references and update copyright year",
+    "social_proof": "Add testimonials, AggregateRating with reviews, or trust badges",
+    "accessibility_signals": "Use semantic HTML (<main>, <nav>), ARIA landmarks, and skip links",
+    "conversion_funnel": "Add visible CTAs, pricing page link, and contact information",
     # Quality Signals Batch B v3.16.0
-    "temporal_coherence": "Add coherent date signals: schema dateModified, visible 'Last updated' dates within 30 days (+8%)",
-    "anchor_text_quality": "Use descriptive anchor text for internal links instead of 'click here' or 'read more' (+5%)",
-    "international_geo": "Add hreflang tags and schema inLanguage for multilingual sites (+5%)",
-    "crawl_budget": "Remove meta robots noindex/nofollow to allow AI crawlers to index content (+5%)",
+    "temporal_coherence": "Add coherent date signals: schema dateModified, visible 'Last updated' dates within 30 days",
+    "anchor_text_quality": "Use descriptive anchor text for internal links instead of 'click here' or 'read more'",
+    "international_geo": "Add hreflang tags and schema inLanguage for multilingual sites",
+    "crawl_budget": "Remove meta robots noindex/nofollow to allow AI crawlers to index content",
     # RAG Readiness Batch v4.1.0
-    "answer_capsule": "Write self-contained answer paragraphs (30-120 words) with concrete facts for RAG extraction (+12%)",
-    "token_efficiency": "Increase content-to-noise ratio: use <main>/<article> tags, reduce boilerplate (+8%)",
-    "entity_resolution": "Define entities at first use and add schema.org with name + description + sameAs (+10%)",
-    "kg_density": "Add explicit relationship statements ('X is a Y', 'founded by Z') for knowledge graph extraction (+10%)",
-    "retrieval_triggers": "Use RAG trigger phrases: 'research shows', 'best practice', 'how to', question headings (+10%)",
+    "answer_capsule": "Write self-contained answer paragraphs (30-120 words) with concrete facts for RAG extraction",
+    "token_efficiency": "Increase content-to-noise ratio: use <main>/<article> tags, reduce boilerplate",
+    "entity_resolution": "Define entities at first use and add schema.org with name + description + sameAs",
+    "kg_density": "Add explicit relationship statements ('X is a Y', 'founded by Z') for knowledge graph extraction",
+    "retrieval_triggers": "Use RAG trigger phrases: 'research shows', 'best practice', 'how to', question headings",
 }
 
 # Order by decreasing impact (excluding penalties)

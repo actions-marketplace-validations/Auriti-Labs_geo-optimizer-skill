@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geo-optimizer-skill"
-version = "4.17.1"
-description = "Generative Engine Optimization toolkit — make websites visible to AI search engines"
+version = "4.19.9"
+description = "GEO Optimizer, the open-source Generative Engine Optimization toolkit behind GeoReady (geoready.dev): audit whether ChatGPT, Perplexity, Claude, Gemini and Google AI Overviews can cite your site"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     {name = "Juan Camilo Auriti", email = "juancamilo.auriti@gmail.com"},
 ]
@@ -18,23 +18,25 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "click>=8.0,<9.0",
-    "requests>=2.28.0,<3.0.0",
+    "requests>=2.31.0,<3.0.0",
     "beautifulsoup4>=4.12.0,<5.0.0",
     "lxml>=4.9.0,<7.0.0",
-    "urllib3>=1.26.0,<3.0.0",
+    "urllib3>=1.26.20,<3.0.0",
+    "rich>=13.0,<16.0",
 ]
 
 [project.optional-dependencies]
+# rich è nelle dipendenze core (output di default di `geo audit`); extra mantenuto per compatibilità
 rich = [
     "rich>=13.0,<16.0",
 ]
@@ -48,19 +50,20 @@ web = [
     "fastapi>=0.110.0,<1.0",
     "uvicorn[standard]>=0.27.0,<1.0",
     "markdown>=3.5.0,<4.0",
-    "python-multipart>=0.0.7,<1.0",
+    "python-multipart>=0.0.18,<1.0",
 ]
 pdf = [
     "weasyprint>=60.0",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    # <2: il server usa mcp.server.fastmcp, rimosso in mcp 2.x (rinominato MCPServer).
+    "mcp>=1.0.0,<2",
 ]
 embedding = [
-    "sentence-transformers>=2.2.0,<6.0",
+    "sentence-transformers>=2.2.0,<7.0",
 ]
 llm = [
-    "openai>=1.0.0,<3.0",
+    "openai>=1.0.0,<4.0",
     "anthropic>=0.30.0,<2.0",
 ]
 dev = [
@@ -93,6 +96,8 @@ where = ["src"]
 # Solo i file compilati .mo — i sorgenti .po non appartengono al pacchetto distribuito (#135)
 "geo_optimizer" = [
     "py.typed",
+    "cli/report_assets/*.woff2",
+    "cli/report_assets/OFL.txt",
     "i18n/locales/*/LC_MESSAGES/*.mo",
     "web/templates/*.html",
     "web/docs/*.md",
@@ -122,7 +127,7 @@ exclude_lines = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]

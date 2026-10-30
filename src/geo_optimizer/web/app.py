@@ -21,14 +21,14 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -46,6 +46,7 @@ from geo_optimizer.core.telemetry import (
     geo_badge_generated,
     geo_score_improved,
 )
+from geo_optimizer.models.config import CATEGORY_MAX
 from geo_optimizer.models.results import SitemapUrl
 
 logger = logging.getLogger(__name__)
@@ -158,14 +159,26 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Nonce-based CSP cannot work with static files (HTML is pre-built without nonce injection).
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com; "
+            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://*.clarity.ms; "
             "style-src 'self' 'unsafe-inline'; "
             "font-src 'self' data:; "
             "img-src 'self' data: https://www.google-analytics.com https://www.googletagmanager.com "
-            "https://launchpadly.co https://cdn.sanity.io; "
-            # region1.google-analytics.com: endpoint regionale GA4 (usato da gtag.js)
-            "connect-src 'self' https://www.google-analytics.com https://analytics.google.com "
-            "https://stats.g.doubleclick.net https://region1.google-analytics.com; "
+            "https://launchpadly.co https://cdn.sanity.io https://*.clarity.ms https://c.bing.com; "
+            # GA4 instrada la raccolta dati su sottodomini regionali sharded
+            # (region1, region2, ...) scelti per sessione — un singolo host
+            # esplicito (region1.google-analytics.com) bloccava silenziosamente
+            # le sessioni instradate su un region diverso. Wildcard su entrambe
+            # le famiglie di dominio usate da GA4.
+            "connect-src 'self' https://www.google-analytics.com https://*.google-analytics.com "
+            "https://analytics.google.com https://*.analytics.google.com "
+            "https://stats.g.doubleclick.net "
+            # Microsoft Clarity: the tag lives on www.clarity.ms, its runtime on
+            # scripts.clarity.ms and it reports to regional *.clarity.ms hosts.
+            # Loaded only after analytics consent (see cookieConsent.ts).
+            "https://*.clarity.ms https://c.bing.com "
+            # Waitlist, newsletter e survey fanno fetch cross-origin verso la SaaS:
+            # senza questa origine il browser blocca la richiesta prima che parta.
+            "https://app.geoready.dev; "
             "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
         )
         # Fix #413: restrict browser API access
@@ -457,13 +470,13 @@ _DOCS_PAGES = {
 }
 
 
-@app.get("/docs/", response_class=HTMLResponse)
+# @app.get("/docs/", response_class=HTMLResponse)
 async def docs_index(request: Request):
     """Documentation index — redirect to the main docs page."""
     return await docs_page(request, "index")
 
 
-@app.get("/docs/{slug}", response_class=HTMLResponse)
+# @app.get("/docs/{slug}", response_class=HTMLResponse)
 async def docs_page(request: Request, slug: str):
     """Render a documentation page from docs/*.md as styled HTML."""
     import re as _re
@@ -702,7 +715,7 @@ async def stats():
             ),
             asyncio.to_thread(
                 _fetch_json,
-                "https://pypistats.org/api/packages/geo-optimizer-skill/system?mirrors=false",
+                "https://pypistats.org/api/packages/geo-optimizer-skill/overall?mirrors=false",
             ),
             _maybe_fetch_stats(),
         )
@@ -712,13 +725,27 @@ async def stats():
         else:
             result["github_stars"] = 13  # Fallback: last known value
 
+        # Monthly downloads: sum the last 30 days of the /overall daily series.
+        #
+        # Two earlier attempts were wrong, both worth recording:
+        #   - /system summed downloads per operating system over the package's WHOLE
+        #     history, so the site published a lifetime cumulative (~74k) under a
+        #     "downloads/mo" label — an overstatement of roughly 13x.
+        #   - /recent reports last_month directly, but pypistats rate-limits that
+        #     endpoint: it answers 429 while /system and /overall answer 200, so the
+        #     field silently fell back to 0 in production.
         if pypi_data:
-            downloads = sum(
-                item.get("downloads", 0)
-                for item in pypi_data.get("data", [])
-                if item.get("category") not in (None, "null")
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+            rows = pypi_data.get("data") or []
+            result["pypi_downloads_month"] = sum(
+                row.get("downloads", 0) for row in rows if isinstance(row, dict) and str(row.get("date", "")) >= cutoff
             )
-            result["pypi_downloads_month"] = downloads
+
+        # Never publish a zero: a counter at 0 reads as "nobody uses this" and is worse
+        # than a value a few hours old. Reuse the last good reading when the upstream
+        # fetch fails (429, timeout), even if the cache entry has expired.
+        if not result["pypi_downloads_month"] and cached:
+            result["pypi_downloads_month"] = cached["data"].get("pypi_downloads_month", 0)
 
         if geo_stats and "stats" in geo_stats:
             result["audits_run"] = geo_stats["stats"].get("audits", 0)
@@ -800,6 +827,18 @@ async def audit_post(request: Request, body: AuditRequest):
 _LLMS_MIN_PER_SECTION = 1
 _LLMS_MAX_PER_SECTION = 20
 # Timeout complessivo per discovery + fetch sitemap + generazione (secondi)
+# nginx cuts the proxy at 60 s (its default proxy_read_timeout). The web audit has to
+# give up a few seconds earlier: with the same 60 s, nginx always won the race and
+# answered with its own HTML 504 (a broken image for /badge) before the friendly
+# error below, or the "Error" badge, could be sent.
+_AUDIT_TIMEOUT_S = 55.0
+
+# Shown on a 504: the web audit is capped (see _AUDIT_TIMEOUT_S), the CLI is not.
+_AUDIT_TIMEOUT_DETAIL = (
+    "Audit timeout: the site took too long to respond (the web audit stops after about a minute). "
+    "Slow sites can still be audited with the CLI: geo audit --url <url>"
+)
+
 _LLMS_GENERATE_TIMEOUT = 30
 
 
@@ -1114,7 +1153,8 @@ async def report(report_id: str):
     from geo_optimizer.cli.html_formatter import format_audit_html
 
     result = _dict_to_audit_result(data)
-    return HTMLResponse(content=format_audit_html(result))
+    # I report riguardano domini di terzi: mai in indice, anche se linkati altrove
+    return HTMLResponse(content=format_audit_html(result), headers={"X-Robots-Tag": "noindex, nofollow"})
 
 
 @app.get("/api/audit/pdf")
@@ -1173,16 +1213,13 @@ async def audit_pdf(
 
             audit_result = await asyncio.wait_for(
                 asyncio.to_thread(run_full_audit, url),
-                timeout=60.0,
+                timeout=_AUDIT_TIMEOUT_S,
             )
             data = _audit_result_to_dict(audit_result)
             await _set_cached(url, data)
             result = audit_result
         except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail="Audit timeout: site takes too long to respond.",
-            ) from exc
+            raise HTTPException(status_code=504, detail=_AUDIT_TIMEOUT_DETAIL) from exc
         except Exception as e:
             logger.error("PDF audit error for %s: %s", url, e)
             raise HTTPException(
@@ -1245,10 +1282,10 @@ async def badge(
             from geo_optimizer.core.audit import run_full_audit
 
             # Run in separate thread to avoid blocking the event loop
-            # Timeout 60s to avoid blocking the event loop (fix #82)
+            # Bounded wait to avoid blocking the event loop (fix #82)
             result = await asyncio.wait_for(
                 asyncio.to_thread(run_full_audit, url),
-                timeout=60.0,
+                timeout=_AUDIT_TIMEOUT_S,
             )
             data = _audit_result_to_dict(result)
             await _set_cached(url, data)
@@ -1256,7 +1293,7 @@ async def badge(
             band = data["band"]
         except asyncio.TimeoutError:
             # Timeout: show badge with "Error" text (fix #152)
-            logger.warning("Badge audit timeout (60s) per URL: %s", url)
+            logger.warning("Badge audit timeout (%.0fs) per URL: %s", _AUDIT_TIMEOUT_S, url)
             from geo_optimizer.web.badge import generate_badge_svg
 
             svg = generate_badge_svg(0, "critical", label=label, error=True)
@@ -1341,7 +1378,7 @@ async def badge_endpoint(
 
             result = await asyncio.wait_for(
                 asyncio.to_thread(run_full_audit, url),
-                timeout=60.0,
+                timeout=_AUDIT_TIMEOUT_S,
             )
             data = _audit_result_to_dict(result)
             await _set_cached(url, data)
@@ -1382,8 +1419,14 @@ def _normalize_url(raw: str) -> tuple[str | None, str]:
     url = normalize_url_scheme(url)
 
     # Must have a hostname with at least one dot (real domain)
-    parsed = urlparse(url)
-    if not parsed.hostname or "." not in parsed.hostname:
+    # urlparse raises ValueError on stray brackets ("Invalid IPv6 URL"), e.g. a
+    # badge snippet pasted with its Markdown tail: https://site.com)](https://...
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+    except ValueError:
+        return None, "Invalid URL: a valid domain is required (e.g. https://example.com)"
+    if not hostname or "." not in hostname:
         return None, "Invalid URL: a valid domain is required (e.g. https://example.com)"
 
     return url, ""
@@ -1419,17 +1462,14 @@ async def _run_audit(url: str) -> JSONResponse:
     try:
         from geo_optimizer.core.audit import run_full_audit
 
-        # Run in separate thread with 60s timeout to avoid blocking the event loop (fix #82)
+        # Run in a separate thread with a bounded wait to avoid blocking the event loop (fix #82)
         result = await asyncio.wait_for(
             asyncio.to_thread(run_full_audit, url),
-            timeout=60.0,
+            timeout=_AUDIT_TIMEOUT_S,
         )
     except asyncio.TimeoutError as exc:
-        logger.warning("Audit timeout (60s) for URL: %s", url)
-        raise HTTPException(
-            status_code=504,
-            detail="Audit timeout: site takes too long to respond.",
-        ) from exc
+        logger.warning("Audit timeout (%.0fs) for URL: %s", _AUDIT_TIMEOUT_S, url)
+        raise HTTPException(status_code=504, detail=_AUDIT_TIMEOUT_DETAIL) from exc
     except Exception as e:
         logger.error("Audit error for %s: %s", url, e)
         raise HTTPException(
@@ -1516,9 +1556,20 @@ def _audit_result_to_dict(result) -> dict:
     # JSON contract version — consumers must handle missing (default 0 = pre-v1)
     base["schema_version"] = 1
 
-    # Garantisce le 8 categorie sempre presenti nel score_breakdown (valore 0 se audit non eseguito)
-    _BREAKDOWN_KEYS = ("robots", "llms", "schema", "meta", "content", "signals", "ai_discovery", "brand_entity")
-    base["score_breakdown"] = {k: base.get("score_breakdown", {}).get(k, 0) for k in _BREAKDOWN_KEYS}
+    # Additive field: recommendations grouped by producing category (+ "other"). Same strings as
+    # base["recommendations"]; an empty dict means the category is unknown (legacy cached result).
+    base["recommendations_by_category"] = {
+        category: list(items) for category, items in result.recommendations_by_category.items()
+    }
+
+    # Categorie della rubrica del risultato sempre presenti (0 se non eseguite); fallback v1 per risultati legacy
+    breakdown_keys = result.score_max or CATEGORY_MAX
+    base["score_breakdown"] = {k: base.get("score_breakdown", {}).get(k, 0) for k in breakdown_keys}
+    base["score_max"] = dict(breakdown_keys)
+    # score_breakdown elenca solo le categorie della rubrica (contratto JSON): la
+    # penalità per segnali negativi restava invisibile e la somma delle categorie
+    # non tornava con score. Chiave top-level opzionale, valore <= 0.
+    base["score_penalty"] = (result.score_breakdown or {}).get("negative_penalty", 0)
 
     # Add the "checks" mapping (structure expected by the frontend and platform)
     # Keys under checks must match gate_service.CATEGORY_KEY_MAP and analytics_dashboard
@@ -1544,6 +1595,8 @@ def _audit_result_to_dict(result) -> dict:
             "has_links": result.llms.has_links,
             "has_full": result.llms.has_full,
             "word_count": result.llms.word_count,
+            "blocked_by_cdn": result.llms.blocked_by_cdn,
+            "validation_warnings": list(result.llms.validation_warnings),
         },
         # Alias keys used by analytics_dashboard
         "llms_found": result.llms.found,
@@ -1709,10 +1762,35 @@ def _dict_to_audit_result(data: dict):
             has_front_loading=c.get("has_front_loading", False),
         ),
         recommendations=data.get("recommendations", []),
+        recommendations_by_category=data.get("recommendations_by_category", {}),
         http_status=data.get("http_status", 0),
         page_size=data.get("page_size", 0),
         score_breakdown=data.get("score_breakdown", {}),
+        # Without these the report fell back to v1 maxima under v2 scores ("Content 14/12")
+        score_version=data.get("score_version", 1),
+        score_max=data.get("score_max", {}),
     )
+
+    if "google_ai" in data and isinstance(data["google_ai"], dict):
+        from geo_optimizer.models.results import GoogleAiReadinessResult, ReadinessCheck
+
+        ga = data["google_ai"]
+        # Old or foreign cache entries may carry extra keys: keep only the known fields
+        check_fields = {f.name for f in dataclasses.fields(ReadinessCheck)}
+        checks = []
+        for c in ga.get("checks", []):
+            if isinstance(c, dict):
+                try:
+                    checks.append(ReadinessCheck(**{k: v for k, v in c.items() if k in check_fields}))
+                except TypeError:
+                    continue
+        result.google_ai = GoogleAiReadinessResult(
+            checked=ga.get("checked", False),
+            points=ga.get("points", 0),
+            max_points=ga.get("max_points", 0),
+            final_url=ga.get("final_url", ""),
+            checks=checks,
+        )
 
     # Fix #34: reconstruct additional fields if present in cache
     if "signals" in data and isinstance(data["signals"], dict):
@@ -1957,7 +2035,7 @@ def _dict_to_audit_result(data: dict):
 #         "# GEO Optimizer\n\n"
 #         "> Open-source toolkit to audit, fix, and optimize any website for AI search engine visibility.\n"
 #         "> Scores 0-100 across 8 categories and 47 research-backed methods.\n"
-#         "> Based on Princeton KDD 2024 and AutoGEO ICLR 2026 peer-reviewed research.\n"
+#         "> Based on Princeton KDD 2024 and AutoGEO (arXiv:2510.11438, preprint) research.\n"
 #         "> MIT License. Free for commercial and personal use.\n\n"
 #         "## What GEO Optimizer Does\n\n"
 #         "GEO Optimizer audits any publicly accessible URL — regardless of CMS, framework, or hosting — "
@@ -1995,29 +2073,29 @@ def _dict_to_audit_result(data: dict):
 #         "- Plugin system: Custom checks via `CheckRegistry` — extend without forking\n\n"
 #         "## Documentation\n\n"
 #         "- [Getting Started]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/getting-started/): "
+#         "(https://geoready.dev/docs/getting-started/): "
 #         "Install and first audit\n"
 #         "- [GEO Audit]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/geo-audit/): "
+#         "(https://geoready.dev/docs/geo-audit/): "
 #         "Full CLI reference\n"
 #         "- [Scoring Rubric]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/scoring-rubric/): "
+#         "(https://geoready.dev/docs/scoring-rubric/): "
 #         "All 8 categories explained\n"
 #         "- [MCP Server]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/mcp-server/): "
+#         "(https://geoready.dev/docs/mcp-server/): "
 #         "AI agent integration\n"
 #         "- [CI/CD]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/ci-cd/): "
+#         "(https://geoready.dev/docs/ci-cd/): "
 #         "GitHub Actions integration\n"
 #         "- [GEO Methods]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/geo-methods/): "
+#         "(https://geoready.dev/docs/geo-methods/): "
 #         "47 research-backed methods\n\n"
 #         "## Reference\n\n"
 #         "- [AI Bots Reference]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/"
+#         "(https://geoready.dev/docs/"
 #         "ai-bots-reference/): 27 AI crawlers documented\n"
 #         "- [Troubleshooting]"
-#         "(https://auriti-labs.github.io/geo-optimizer-skill/troubleshooting/): "
+#         "(https://geoready.dev/docs/troubleshooting/): "
 #         "Common issues\n"
 #         "- [Changelog]"
 #         "(https://github.com/Auriti-Labs/geo-optimizer-skill/blob/main/CHANGELOG.md): "
@@ -2026,7 +2104,7 @@ def _dict_to_audit_result(data: dict):
 #         "Package and version history\n\n"
 #         "## Research Foundation\n\n"
 #         "- GEO: Generative Engine Optimization — Princeton NLP, KDD 2024 — https://arxiv.org/abs/2311.09735\n"
-#         "- AutoGEO: Automatic GEO — Carnegie Mellon, ICLR 2026 — https://arxiv.org/abs/2510.11438\n"
+#         "- AutoGEO: Automatic GEO — Carnegie Mellon, arXiv preprint 2025 — https://arxiv.org/abs/2510.11438\n"
 #         "- llms.txt specification — Answer.AI — https://llmstxt.org/\n"
 #         "- geo-checklist.dev standard — https://geo-checklist.dev/\n\n"
 #         "## Optional\n\n"
@@ -2082,10 +2160,10 @@ async def ai_faq():
             {
                 "question": "How is the score calculated?",
                 "answer": (
-                    "Across 8 categories: robots.txt (18pt),"
-                    " llms.txt (18pt), schema (16pt), meta (14pt),"
-                    " content (12pt), signals (6pt), AI discovery (6pt),"
-                    " brand & entity (10pt)."
+                    "Across 9 rubric v2 categories: Google AI readiness (20pt),"
+                    " robots.txt (14pt), schema (14pt), content (14pt),"
+                    " brand & entity (12pt), meta (11pt), llms.txt (6pt),"
+                    " signals (6pt), and AI discovery (3pt)."
                 ),
             },
             {"question": "Is it free?", "answer": "Yes, MIT License. Install: pip install geo-optimizer-skill"},
@@ -2373,6 +2451,11 @@ async def analyze_logs(request: Request):
             detail="Missing or invalid authentication token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    # Unico POST senza rate limit: accetta upload fino a 10 MB e li analizza in un
+    # thread, quindi senza limite un singolo client poteva saturare CPU e disco.
+    # Il controllo avviene prima di leggere il body.
+    if not await _check_rate_limit(_get_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again soon.")
 
     try:
         form = await request.form()
@@ -2415,6 +2498,51 @@ async def analyze_logs(request: Request):
 
     return JSONResponse(content=dataclasses.asdict(result))
 
+
+# ─── Redirect 301 espliciti (SEO) ─────────────────────────────────────────────
+# Pagine che sono esistite in produzione (e avevano ranking/impression in GSC) ma
+# sono cadute nel passaggio di branch: senza redirect rispondono 404 e l'equity
+# accumulata va persa. Registrate PRIMA del mount StaticFiles così vincono il
+# match; la variante senza slash va registrata a parte perché per un path
+# inesistente StaticFiles risponderebbe 404 senza mai emettere il 307/301.
+_SEO_REDIRECTS = {
+    "/de/beste-geo-tools": "/best-geo-tools/",
+    "/nl/beste-geo-tools": "/best-geo-tools/",
+    # Il vecchio slug a unica pagina di State of GEO (soft-404 client-side) →
+    # vera 301 alla versione completa di giugno 2026.
+    "/state-of-geo-2026": "/state-of-geo/june-2026/",
+    # Paginazione /guides/ rimossa (55 guide su un'unica pagina): le URL 2..10
+    # consolidano su /guides/ invece di restare doorway sottili.
+    "/guides/2": "/guides/",
+    "/guides/3": "/guides/",
+    "/guides/4": "/guides/",
+    "/guides/5": "/guides/",
+    "/guides/6": "/guides/",
+    "/guides/7": "/guides/",
+    "/guides/8": "/guides/",
+    "/guides/9": "/guides/",
+    "/guides/10": "/guides/",
+    # Vecchio URL della home docs, ancora con click e impression in GSC.
+    "/docs/index": "/docs/",
+}
+
+
+def _register_seo_redirects() -> None:
+    for source, target in _SEO_REDIRECTS.items():
+
+        def make_handler(dest: str):
+            async def permanent_redirect() -> RedirectResponse:
+                return RedirectResponse(url=dest, status_code=301)
+
+            return permanent_redirect
+
+        handler = make_handler(target)
+        # HEAD too: link checkers and `curl -I` would otherwise fall through to the static mount and see a 404.
+        for path in (source, source + "/"):
+            app.api_route(path, methods=["GET", "HEAD"], include_in_schema=False)(handler)
+
+
+_register_seo_redirects()
 
 # Garantisce il MIME corretto per i woff2 (alcuni ambienti li servono come
 # application/octet-stream, invalidando il <link rel="preload" as="font">).

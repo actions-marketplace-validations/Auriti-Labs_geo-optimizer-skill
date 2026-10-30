@@ -12,7 +12,7 @@ Configuration via environment variables:
 MiniMax-specific configuration:
   MINIMAX_API_FORMAT    — openai | anthropic (default: openai)
   MINIMAX_API_BASE_URL  — API root override for another supported region
-  MINIMAX_THINKING      — adaptive | disabled for MiniMax-M3 (MiniMax-M2.7 is always on)
+  MINIMAX_THINKING      — adaptive | disabled for MiniMax-M3; Flash normalizes either to adaptive
 
 Requires: pip install geo-optimizer-skill[llm] (except Perplexity, MiniMax, Gemini and DeepSeek)
 """
@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TypedDict, Union
+from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ _PROVIDER_DEFAULTS = {
     "anthropic": "claude-sonnet-4-20250514",
     "groq": "llama-3.3-70b-versatile",
     "perplexity": "sonar",
-    "minimax": "MiniMax-M3",
+    "minimax": "MiniMax-M3.1-Flash",
     "gemini": "gemini-3.7-flash",
     "deepseek": "deepseek-v4-flash",
 }
@@ -78,7 +78,7 @@ class LLMContentPart(TypedDict, total=False):
     source: dict[str, object]
 
 
-LLMPrompt = Union[str, list[LLMContentPart]]
+LLMPrompt = str | list[LLMContentPart]
 
 
 @dataclass
@@ -350,7 +350,8 @@ def _query_minimax(prompt: LLMPrompt, *, system: str, api_key: str, model: str, 
         }
 
     if thinking:
-        payload["thinking"] = {"type": thinking}
+        # Flash does not support disabled thinking, including saved M3 settings.
+        payload["thinking"] = {"type": "adaptive" if model == "MiniMax-M3.1-Flash" else thinking}
 
     try:
         resp = requests.post(

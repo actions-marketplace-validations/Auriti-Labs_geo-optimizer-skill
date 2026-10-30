@@ -10,7 +10,9 @@ import json  # noqa: F401 (available for future extensions)
 import re  # noqa: F401 (available for future extensions)
 from typing import TYPE_CHECKING
 
+from geo_optimizer.models.config import KNOWN_FORM_EMBED_HOSTS
 from geo_optimizer.models.results import AiDiscoveryResult, SchemaResult, WebMcpResult
+from geo_optimizer.utils.jsonld import schema_types
 
 if TYPE_CHECKING:
     from bs4 import BeautifulSoup
@@ -26,22 +28,17 @@ def _extract_actions(schema_obj, action_types: set) -> None:
     if isinstance(schema_obj, dict):
         # Support @graph (Yoast SEO, RankMath)
         if "@graph" in schema_obj:
-            for item in schema_obj["@graph"]:
+            graph = schema_obj["@graph"]
+            for item in graph if isinstance(graph, list) else [graph]:
                 _extract_actions(item, action_types)
             return
 
         potential = schema_obj.get("potentialAction")
-        if potential:
-            if isinstance(potential, dict):
-                action_type = potential.get("@type", "")
-                if action_type:
-                    action_types.add(action_type)
-            elif isinstance(potential, list):
-                for action in potential:
-                    if isinstance(action, dict):
-                        action_type = action.get("@type", "")
-                        if action_type:
-                            action_types.add(action_type)
+        actions = potential if isinstance(potential, list) else [potential]
+        for action in actions:
+            if isinstance(action, dict):
+                # @type puo' essere una lista: aggiungere la lista a un set sollevava TypeError
+                action_types.update(schema_types(action.get("@type")))
     elif isinstance(schema_obj, list):
         for item in schema_obj:
             _extract_actions(item, action_types)
@@ -134,6 +131,25 @@ def audit_webmcp_readiness(
     if labeled_count > 0:
         result.has_labeled_forms = True
         result.labeled_forms_count = labeled_count
+    else:
+        # No native <form> found accessible — but a form's fields can live
+        # inside a cross-origin <iframe> (Tally, Typeform, HubSpot, JotForm,
+        # Google Forms, etc.), invisible to this static fetch. A known
+        # provider's embed is credited toward agent-usable forms since these
+        # providers build accessible markup into their hosted forms by
+        # default (same pattern as has_webmcp_declaration above).
+        for iframe in soup.find_all("iframe"):
+            # Some embed snippets (e.g. Tally's data-tally-src) set the real
+            # URL on a data-*-src attribute and leave src empty until a
+            # loader script runs client-side — check src and every such
+            # data-*-src attribute.
+            candidates = [(iframe.get("src") or "").lower()] + [
+                v.lower() for k, v in iframe.attrs.items() if k.startswith("data-") and k.endswith("-src")
+            ]
+            if any(host in candidate for candidate in candidates for host in KNOWN_FORM_EMBED_HOSTS):
+                result.has_labeled_forms = True
+                result.has_embedded_form_provider = True
+                break
 
     # ── 4. OpenAPI/Swagger detection ─────────────────────────────
     openapi_patterns = ["/api-docs", "/swagger", "openapi.json", "openapi.yaml", "swagger.json"]

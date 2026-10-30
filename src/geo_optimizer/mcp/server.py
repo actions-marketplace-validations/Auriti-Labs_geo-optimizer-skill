@@ -21,7 +21,7 @@ Available tools (12):
 Available resources:
     geo://ai-bots            — List of tracked AI bots
     geo://score-bands        — GEO score bands
-    geo://methods            — 47 citability methods with impact data (dynamic)
+    geo://methods            — 47 citability methods with legacy impact labels (dynamic)
     geo://changelog          — Latest changes
     geo://ai-discovery-spec  — AI discovery endpoint specification
 
@@ -65,15 +65,18 @@ def _normalize_url(url: str) -> str:
 
 
 @mcp.tool()
-def geo_audit(url: str) -> str:
+def geo_audit(url: str, score_version: int = 2) -> str:
     """Run a complete GEO audit on a website.
 
-    Analyzes 5 areas: robots.txt (AI bot access), llms.txt (AI index),
-    JSON-LD schema, SEO meta tags and content quality.
+    Uses rubric v2 by default (Google AI readiness) and supports rubric v1
+    for legacy comparisons. Rubric v2 analyzes Google AI Search readiness,
+    robots.txt, JSON-LD schema, content, brand and entity signals, SEO meta
+    tags, llms.txt, technical signals, and AI discovery endpoints.
     Returns score 0-100 with details and recommendations.
 
     Args:
         url: URL of the site to audit (e.g. https://example.com)
+        score_version: Scoring rubric version: 2 (default) or 1 (legacy).
     """
     from geo_optimizer.utils.validators import validate_public_url
 
@@ -83,11 +86,15 @@ def geo_audit(url: str) -> str:
     safe, reason = validate_public_url(url)
     if not safe:
         return json.dumps({"error": f"Unsafe URL: {reason}", "url": url})
+    from geo_optimizer.models.config import CATEGORY_MAX_BY_VERSION
+
+    if isinstance(score_version, bool) or score_version not in CATEGORY_MAX_BY_VERSION:
+        return json.dumps({"error": "score_version must be 1 or 2", "url": url})
 
     try:
         from geo_optimizer.core.audit import run_full_audit
 
-        result = run_full_audit(url)
+        result = run_full_audit(url, score_version=score_version)
         return _to_json(result)
     except Exception as e:
         # Fix #314: do not expose str(e) to the client — log internally
@@ -203,7 +210,7 @@ def geo_citability(url: str) -> str:
     """Analyze content citability using 47 methods (Princeton GEO + AutoGEO + content analysis).
 
     Evaluates page content with 47 methods from Princeton KDD 2024,
-    AutoGEO ICLR 2026, SE Ranking 2025, and Growth Marshal 2026.
+    AutoGEO (arXiv:2510.11438, preprint), SE Ranking 2025, and Growth Marshal 2026.
 
     Returns score 0-100 with per-method detail and suggestions.
 
@@ -603,7 +610,11 @@ def get_score_bands() -> str:
 
 @mcp.resource("geo://methods")
 def get_citability_methods() -> str:
-    """All 47 citability methods with measured impact (fix #1: generated dynamically from the engine)."""
+    """All 47 citability methods with their historical impact label (generated dynamically from the engine).
+
+    The ``impact`` value is a legacy label kept for compatibility: it is not measured on current
+    engines and does not affect the score.
+    """
     from bs4 import BeautifulSoup
 
     from geo_optimizer.core.citability import audit_citability
@@ -628,7 +639,8 @@ def get_citability_methods() -> str:
             "total_methods": len(methods),
             "total_max_score": total_max,
             "note": "Score capped at 100",
-            "source": "Princeton KDD 2024 + AutoGEO ICLR 2026 + SE Ranking 2025 + Growth Marshal 2026",
+            "impact_note": "impact is a historical label, unverified and not re-measured on current engines; it does not affect the score",
+            "source": "Princeton KDD 2024 + AutoGEO (arXiv:2510.11438, preprint) + SE Ranking 2025 + Growth Marshal 2026",
         },
         indent=2,
     )

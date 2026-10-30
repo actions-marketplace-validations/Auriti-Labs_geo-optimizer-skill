@@ -5,6 +5,265 @@ Format: [Keep a Changelog](https://keepachangelog.com/) · [SemVer](https://semv
 
 ---
 
+## [Unreleased]
+
+## [4.19.9] — 2026-10-30
+
+### Changed
+- User-facing text no longer presents per-method "+N% AI visibility" figures as results of the Princeton GEO paper. Audit findings, CI output and the recommendations text drop the unsourced percentages; the paper reports figures only as relative gains in visibility metrics on its own benchmark, and the per-method values in the docs are labelled as derived from its Table 1 absolute scores. `MethodScore.impact` is documented as a historical, unverified label.
+- The rubric documents state the nine categories of rubric v2 and describe `llms.txt` as agent-facing hygiene. The demo templates (`index`, `manifesto`, `research`) use the same wording.
+- HTML and PDF audit report (`geo audit --format html|pdf`, `/report/{id}`, `/api/audit/pdf`) redrawn in the GeoReady v3 design: light paper page in A4 with the site URL and page numbers in the margin, Stack Sans embedded in the file (OFL 1.1, licence shipped in `cli/report_assets/`), a score ring drawn to the score in the band colour, a summary of key checks and recommendations, numbered recommendations. On screen the report follows the system dark mode and drops the progress column under 640px.
+
+### Fixed
+- PDF report: the status column printed empty boxes, because the ✅/❌ emoji have no font in the web image. Statuses are now the words "Pass" and "Fix".
+- `/report/{id}` and `/api/audit/pdf` rebuilt cached audits without the rubric version, the category maxima and the Google AI checks, so a v2 result was printed against v1 maxima (for example "Content Quality 14/12") and without the Google AI Search row. All three are now restored from the cache.
+
+## [4.19.8] — 2026-10-26
+
+### Added
+- `geo audit --url <url> --max-pages N`: find the site's sitemap and audit up to N of its pages, reporting the average score (the existing `--sitemap` batch path, without needing the sitemap URL). Optional: the default single-page score does not change. Text or JSON output only; exits 1 when no sitemap is found.
+
+### Changed
+- `geo access`: the heavy-HTML warning now says how much of the weight is inline `<script>`/`<style>`, so a framework page over 200KB with little copy is told where the weight comes from. The threshold moved to `HTML_WEIGHT_WARN_BYTES` in `models/config.py`; its value is unchanged. Reported by Neurounit on Habr.
+- `geo --lang` help said Italian was the default output language. Output is English; the help now says the flag is reserved for localization and goes before the command.
+- `geo audit` text output: sections 12-19 (trust stack, RAG chunk readiness, embedding proximity, content decay, platform citation profile, context window, instruction following, multimodal) now say they are diagnostics outside the 0-100 score. They never counted toward it, but the "Chunk readiness: 0/100" line next to a high total read as a contradiction. No score changes.
+
+### Fixed
+- `boilerplate_ratio` (negative signals) could exceed 1.0 on pages without `<main>`/`<article>`: a `<nav>` inside a `<header>` was counted twice. Only the outermost `nav`/`header`/`footer` region counts now, and the ratio is capped at 1.0. Reported by Neurounit on Habr (tested on 4.18.2).
+- The About-link check (Brand & Entity) recognised only English and Italian slugs, so a German `/ueber-uns` or a French `/a-propos` page failed it. Added German, French, Spanish, Portuguese and Dutch slugs, with their `#` anchors. Reported by Qilano.
+- RAG chunk readiness matched definitions and anchor sentences only in English: the definition opening needed an English verb (`is`, `refers to`...) and both patterns needed an ASCII capital, so Cyrillic and Greek pages and sentences opening with `È` or `Ü` scored lower for the same structure. Definition verbs now cover English, Italian, German, French, Spanish, Portuguese, Dutch and Russian (`— это`, `является`), and capitals cover Latin-1, Greek and Cyrillic. English results are unchanged. Reported by Neurounit on Habr.
+
+### Security
+- Website dependencies: the frontend lockfile is refreshed on top of 4.19.4 and `overrides` raise `js-yaml` 3.x, `fflate`, `smol-toml`, `uuid` and `postcss-selector-parser` (#623). `npm audit` goes from 29 findings to 14; the rest are `braces` and `sprintf-js` (no patched release, build-time Sanity CLI tooling) and their parents.
+
+### Fixed (site consistency)
+- The audit report page said the free plan monitors one domain with a weekly drift email; it now matches the platform, where score monitoring starts on Pro (the README and the `geo audit` footers are fixed in 4.19.6).
+- The four `*-alternative` comparison pages said the free audit covers 8 categories; it is nine since 4.19.0.
+- `/state-of-geo/` renders a dated benchmark snapshot in the HTML (it loaded numbers only through client script) and no longer says llms.txt and schema are "missing more often than not" while the cohort shows 58% and 76%. One snapshot (`lib/benchmarkSnapshot.ts`, matching the README figures of 17 October 2026) now feeds `/state-of-geo/`, `/best-geo-tools/` and `/veesie-alternative/`.
+- `/best-geo-tools/` shows a single modified date and drops the legacy v1 weights figure.
+- `/best-geo-tools/` now has a dated table of named tools (Profound, RankScale, Goodie, Veesie, AEO Vision, Otterly, Semrush AI Visibility Toolkit and GeoReady) built only from facts already recorded, with sources, on the linked comparison pages (checked 16-21 September 2026); it is not a ranking and says so, and it discloses that GeoReady is the site's own product.
+- `/analyze-competitors/`: title, H1 and schema name match the queries the page answers, the worked example is labelled hypothetical and two unsourced claims are reworded.
+- `/research/`: the Jaccard and 57.8% figures of arXiv 2604.07585 are stated as the paper states them (day-to-day similarity of cited sources; ChatGPT runs with no citations; Swiss-German verticals), and two internal analyses without method or sample no longer quote a number.
+- Snippet tests started 2026-10-18 (one change per page, 28-day window): `/chatgpt-visibility-checker/` title and meta now say what it measures (it does not query ChatGPT) with an FAQ on how to check whether ChatGPT cites you; `/research/` meta names the sources and the 47 citability checks.
+- Internal links (GSC check of 22 September-19 October 2026): the homepage and `/tools/ai-citation-checker/` link once each, in running text, to `/guides/what-are-ai-citations/`, `/guides/ai-citations-check/`, `/citation-gap-analysis/` and `/rankscale-alternative/`, with the query each page ranks 8-19 for as anchor text.
+- `/rankscale-alternative/` title and meta, `/citation-gap-analysis/` title, meta and H1 match the queries they answer ("rankscale alternative", "citation gap analysis", "ai citation gap analysis").
+- `/docs/index` (404, still clicked from Google) answers 301 to `/docs/`.
+- The permanent SEO redirects (`/docs/index`, `/guides/2` to `/guides/10`, `/state-of-geo-2026`) also answer HEAD with a 301; before, only GET did and `curl -I` saw a 404.
+
+### Fixed (site contrast)
+- Colour tokens nudged to reach 4.5:1 for small text, as approved: `pass` `#0B8076` to `#0A7970`, `warn` `#9C6A06` to `#926306`, `fail` `#C93A2E` to `#C5392D`. A new `pass-light` (`#0D978C`) is used for the `exit 0` terminal labels on the dark well (3.9:1 before, 4.6:1 now), and the light text on the teal call-to-action panels is solid `pass-wash` instead of 70-90% opacity (3.2-4.2:1 before, 4.8:1 now). A colour scan of all 140 built pages (animations off) drops from 229 to 191 findings; the rest are the docs theme (fixed separately), the dimmed empty categories of the demo report and the `queued` grey on the roadmap.
+
+### Changed
+- MiniMax defaults to `MiniMax-M3.1-Flash`; explicit thinking settings normalize to adaptive for Flash. `MiniMax-M3` and custom/legacy model overrides keep their existing behavior across both protocols and regions.
+- Python 3.9 is no longer supported (end of life since October 2025): `requires-python` is now `>=3.10`, CI and the publish workflow no longer run 3.9. On Python 3.9, pip keeps installing 4.19.3. The `mcp` extra no longer needs a version marker.
+
+### Documentation
+- README FAQ: a "How do I improve my site's GEO score?" answer (audit, `geo fix` preview, re-audit, where the benchmark shows the biggest gap) with two links under their own UTM campaign (`faq-start`).
+- README: a second benchmark chart (`assets/benchmark-bands.svg`) with the share of 1,896 audited sites per score band (Foundation 57.6%, Good 28.2%, Critical 12.4%, Excellent 1.8%), from one aggregate query on the benchmark table (latest audit per domain, scheduled re-audits excluded); counts and shares only. `scripts/render_benchmark_chart.py --bands` renders it.
+- README: a short GIF of the browser audit (`assets/web-audit.gif`, a live run on geoready.dev) under the web-audit button.
+- README: a "No terminal?" web-audit button under the install command, the benchmark figures refreshed (1,800+ sites, median 59, 58% `llms.txt`, 76% JSON-LD) with a dated chart (`assets/benchmark.svg`, rendered by `scripts/render_benchmark_chart.py` from the public aggregate endpoint) and a call to action under it, and the FAQ now says Python 3.10–3.14.
+- `research/calibration-2026-10/`: the pre-registered analysis plan, an anonymised results table and the analysis output of the October 2026 calibration study (does the GEO score predict whether Perplexity cites a page; no effect detected).
+- Roadmap (`docs/ROADMAP.md` and the public roadmap page): added the shipped v4.19.3 patch.
+- `TRADEMARKS.md`: a draft name and logo policy for forks and derived products (the MIT licence covers the code, not the names). Linked from the README.
+- README: the GitHub stars badges no longer use the shields.io `github/stars` endpoint, which was returning "Unable to select next GitHub token from pool". The count badge at the top now comes from badgen.net; the call-to-action at the bottom is a static shields.io badge without a number.
+
+## [4.19.7] — 2026-10-24
+
+### Fixed
+- Brand & Entity: a site typed directly as a LocalBusiness subtype (`RoofingContractor`, `Plumber`, `HVACBusiness`, `Electrician`, `GeneralContractor` and 21 more added to `ORGANIZATION_TYPES`) lost the contact-info point and the geographic-identity point, and got an "Add address, telephone or contactPoint" recommendation it had already met. The geo signal now accepts any Organization subtype with an address. Scores for such sites can rise by up to 2 points.
+
+## [4.19.6] — 2026-10-22
+
+### Fixed
+- CLI and README: the `geo audit` footer (text and rich output) and the README said the free plan monitors one domain with a weekly drift email. Since 2026-10-20 the free plan saves reports and runs one real AI answer check a week, and weekly score monitoring starts on Pro; the wording now says so.
+
+## [4.19.5] — 2026-10-18
+
+### Fixed
+- Web API: the web audit now stops at 55 s instead of 60 s. nginx cuts the proxy at 60 s, so the engine's own graceful answer (the JSON 504 that points to the CLI, or the "Error" badge for `/badge`) always lost the race and users got nginx's HTML 504 or a broken badge image. The 504 text no longer says "more than 60 seconds".
+
+## [4.19.4] — 2026-10-17
+
+### Fixed
+- Web API: a URL carrying stray brackets (a badge snippet pasted with its Markdown tail, `https://site.com)](https://...`) made `/badge` and six other URL endpoints return HTTP 500 (`ValueError: Invalid IPv6 URL`). They now return 400 with the usual invalid-URL message.
+- Docs site: the Starlight favicon pointed to `src/assets/geoready-logo.svg`, which Starlight turns into the URL `/src/assets/geoready-logo.svg` (404 on every docs page). It now uses `/favicon.svg` from `public/`.
+- Site: the automatic `sitemap-index.xml` no longer lists the pages that carry `noindex` (the mock report, the report shell and the visual lab). `robots.txt` points to the hand-built `/sitemap.xml`, which was already clean.
+- Docs: every docs page now has exactly one `<h1>` (21 pages repeated the title as a body heading and the docs home hero used a third); the Perplexity crawler link in `ai-bots-reference` no longer returns 404.
+- Docs theme, light: Starlight's `--sl-color-white` token was the paper colour but is the strongest text colour in Starlight, so page titles, the sidebar group labels and the Note callout text were near-white on white (1.09:1). The token is now ink. The doc card paragraphs lost an `opacity` that pushed their code spans under 4.5:1, and the dark-theme "Get Started" button text is dark (it was white on light teal, 1.9:1).
+- Keyword-stuffing checks (`audit_negative` and the `keyword_stuffing` citability method) no longer flag a page's own brand name or the function words of its language (#607). Function-word lists now cover English, Italian, German, French, Spanish, Portuguese and Dutch, picked from `<html lang>` (every list when the attribute is missing); a declared language without a list skips the check. The brand comes from `og:site_name`, JSON-LD `Organization`/`WebSite`/`Brand` names, and a short `<title>` or `<h1>` prefix or suffix. The citability method also needs at least 5 uses of a word, and its word pattern now keeps `ü`, `ß` and other non-ASCII letters whole. Thresholds and weights are unchanged.
+
+### Security
+- Website dependencies: `npm audit fix` on `frontend/package-lock.json` (lockfile only). The production audit goes from 40 findings to 29; the rest sit behind a major `@astrojs/starlight` upgrade and are build-time tools of a static site.
+
+### Changed
+- CI also tests Python 3.10 (declared but never tested) and 3.14, and the package now carries the 3.14 classifier. No runtime change.
+
+## [4.19.3] — 2026-10-16
+
+### Changed
+- The web audit (`/api/audit` and the PDF route) now says on a 504 that the site took more than 60 seconds and that the CLI (`geo audit --url <url>`) has no such cap. Only the `detail` text changes; the status code and the 60 s limit are unchanged.
+
+### Documentation
+- `docs/json-contract.md`: state that when `error` is set, `score` and `band` are defaults and do not describe the site.
+
+### Fixed
+- The keyword stuffing check now counts words in any alphabet. It matched only Latin letters, so on Cyrillic, Greek and other non-Latin pages the word total shrank to the few Latin words and a normal brand term could be flagged as stuffing.
+
+## [4.19.2] — 2026-10-14
+
+### Added
+- Added `AuditResult.recommendations_by_category`, also emitted by `geo audit --format json` and the web API (`schema_version` stays `1`, additive field). It groups the strings of `recommendations` by the `score_breakdown` category that produced them (`robots`, `meta`, `signals`, ...), plus two non-scored keys: `blockers` (CDN/WAF block, content that needs JavaScript, critical prompt injection, critical UGC injection risk) and `other` (non-critical UGC advisory, negative signals, WebMCP, multimodal). `recommendations` is unchanged. Unreachable-site and HTTP-error results carry a single recommendation under `{"other": [...]}`; batch timeout/exception results (`core/batch_audit.py`) have both fields empty. New core helpers `build_categorized_recommendations()` and `group_recommendations_by_category()`; `build_recommendations()` keeps its signature and output. See `docs/json-contract.md`.
+
+## [4.19.1] — 2026-10-14
+
+### Security
+- The async HTTP path (used by `geo audit` when httpx is installed and by batch/sitemap audits) now connects to the IP validated by the anti-SSRF check instead of resolving the hostname again, closing a DNS-rebinding window; SNI and certificate checks still use the hostname. With an HTTP(S) proxy configured, requests sent through the proxy are resolved by the proxy, as on the sync path (#577).
+- Response size limits are enforced while the body streams, on both the sync and async paths: a live response was previously read in full before the `max_size` check, and redirect bodies are no longer read at all (#576, #577).
+- `POST /api/logs/analyze` is now rate-limited like the other POST endpoints (#580).
+- Server-rendered reports at `/report/{id}` send `X-Robots-Tag: noindex, nofollow` (#571).
+
+### Changed
+- Brand & Entity: a schema name now counts for brand-name consistency for every Organization subtype (`LocalBusiness`, `Restaurant`, `Store`, ...), not only for the literal `Organization`, and checks that read only the first `@type` of a list now consider every declared type. Sites using these shapes can score higher, and `brand_entity.primary_name` can change to the schema name (#579).
+- G-BYLINE now resolves an author declared as an `@id` reference (Yoast, RankMath) to a `Person` or `Organization` node, so those pages pass instead of reporting "No author found" (#581).
+- The web API JSON has a new optional top-level `score_penalty` (negative-signal penalty, `0` or below); `score_breakdown` still lists only rubric categories (#580).
+- `mcp` is pinned below 2.0, since mcp 2.x removed the FastMCP API the server uses; on Python 3.9, which mcp 1.x does not support, the `[mcp]` and `[all]` extras now install without it (#575).
+
+### Fixed
+- `geo audit --format rich` no longer truncates the category scores at 80 and 100 columns: the rubric v2 llms.txt label is shorter in the terminal dashboard and the bar and score columns keep a minimum width.
+- A malformed JSON-LD field (non-string `@type`, `offers` or `aggregateRating` as a string, `sameAs` as a number or object, a null `@graph`, ...) no longer makes the whole audit fail (#579).
+- The sync audit now detects a CDN-blocked `llms.txt` (403/406) and retries it, as the async path already did; the same site could differ by up to 18 points between the two paths (#569).
+- Batch and sitemap audits no longer time out healthy pages: the per-URL deadline is 60 s instead of the 10 s performance budget (#556, #570).
+- The llms.txt CDN retry no longer blocks the event loop in async and batch audits (#581).
+- Connection errors are retried at most 4 times instead of up to 16, and a server's `Retry-After` is capped at 10 s (#576).
+- Relative and protocol-relative redirect locations (`page.html`, `../x`, `//host/x`) are resolved correctly (#576).
+- Body read errors (truncated or corrupt responses) are reported as fetch errors instead of raising (#576).
+- The web report no longer shows invented failures or rubric v1 maxima on partial or gated API payloads ("Content 14/12", "No llms.txt found", "Citability 0/100"): missing data is not shown as a failed check, maxima follow the payload's rubric version, locked categories render as locked, and a missing citability score shows a dash (#578).
+
+### Documentation
+- `SKILL.md`: corrected crawler semantics (Google-Extended does not control AI Overviews; search-tier vs training bots), research claims and CLI flags (#572).
+- Site and docs: applied the 2026-10-08 SEO audit and cite AutoGEO as an arXiv preprint (arXiv:2510.11438) instead of ICLR 2026 (#573).
+- `docs/json-contract.md` documents `score_penalty`; the MCP docs state that the server requires Python 3.10+ (#575, #580).
+- Replaced the README hero GIF with a current rubric v2 terminal dashboard (`assets/tui-audit.svg`) and regenerated `assets/fix.svg`.
+- Documented `geo llms --check-drift` and `--llms-file` in `docs/llms-txt.md`.
+- Added the `howto`, `review` and `product` types to the `geo schema --type` table in `docs/schema-injector.md`.
+- Pinned the GitHub Action examples in `docs/ci-cd.md` to v4.19.0.
+- Updated the roadmap (`docs/ROADMAP.md` and the public roadmap page): release order, rubric v2 wording (9 categories), remaining planned items.
+
+---
+
+## [4.19.0] — 2026-10-09
+
+### Changed
+- Rubric v2 is now the default; all category scores change. Use `--score-version 1` for legacy comparisons.
+- Brand consistency no longer counts title + og:title alone as consistent; this also lowers some v1 brand scores.
+
+### Added
+- Added the `google_ai` category and Google readiness checks, markdown negotiation, image alt coverage, visible schema name matching, SARIF rules with Google `helpUri`, `score_version` and `score_max` in JSON, MCP `score_version`, and the offline calibration test.
+
+### Fixed
+- Google-Extended is no longer scored in the Google AI platform profile; Googlebot is.
+- Fixed the unreachable schema richness branch.
+- Brand consistency now counts each name source once and keeps hyphenated names whole.
+
+---
+
+## [4.18.3] — 2026-09-22
+
+A CDN/WAF discovery patch. When a target's `/llms.txt` exists but its CDN/WAF
+rejects the auditor's User-Agent (403/406), GeoReady previously reported a
+misleading "No llms.txt found" and — worse — the `blocked_by_cdn` branch in
+`generate_llms_fix` returned an *empty* `llms.txt` for `geo fix --apply` to
+write, overwriting a real file.
+
+### Added
+- **CDN/WAF blocking detection for `llms.txt`.** `LlmsTxtResult` gains a
+  `blocked_by_cdn` flag. On a 403/406 response the audit sets it and adds a
+  warning instead of treating the file as absent (`audit_llms_txt` and
+  `_audit_llms_from_response`). Both the sync and the async audit flows now
+  pass the `/llms.txt` URL through, so the retry below actually runs in
+  `geo audit` / `geo-web` — before, the browser-like retry lived only in
+  `audit_llms_txt`, which no main audit path called, so it was dead code.
+- **Browser-like retry to recover a blocked file.** After a 403/406 the audit
+  re-fetches once with a real desktop browser User-Agent (Chrome/120,
+  centralized as `BROWSER_USER_AGENT` in `models/config.py`, replacing the
+  previous `Mozilla/5.0 (compatible; ...)` bot signature that modern WAFs
+  block anyway). If the retry returns 200 with a text payload, the file is
+  processed normally and the CDN block is surfaced as a warning. A guard
+  rejects the WAF fallback pattern (200 with an HTML page) so it is not
+  mistaken for a valid `llms.txt`.
+- **`fetch_url` now accepts an optional `headers` argument** (per-request
+  User-Agent override), applied on the initial session and re-applied when a
+  redirect recreates it — still routed through the full DNS-pinned,
+  size-limited secure fetch, so no anti-SSRF protection is bypassed.
+
+### Fixed
+- **`geo fix --apply` no longer writes an empty `llms.txt`** when the file is
+  CDN-blocked. `generate_llms_fix` still generates the complete file from the
+  sitemap (so a real file is written when the site genuinely lacks one) and
+  appends a note to the recommendation describing the CDN/WAF exception or a
+  WAF-bypassing path when the audit flagged a block.
+
+## [4.18.2] — 2026-09-19
+
+A security patch: `fetch_sitemap()` and `discover_sitemap()` fetched their initial URL through
+the SSRF-safe, DNS-pinned session, but followed HTTP redirects via plain `requests`
+(`allow_redirects` defaulting to `True`) — a redirect response could repoint the request at an
+internal address (`http://169.254.169.254/`, a private IP, ...) without ever being revalidated,
+bypassing the DNS pin entirely. Both functions now route through the shared `fetch_url()` helper,
+which resolves and validates every redirect hop manually instead of trusting `requests` to follow
+them unchecked. The async fetch path (`fetch_url_async`) had a matching gap — a validated redirect
+target could still connect over the *original* DNS pin instead of the revalidated one (TOCTOU) —
+now re-pins to the redirect's own resolved IP before the next hop. Dependency floors raised against
+known CVEs: `requests>=2.31.0`, `urllib3>=1.26.20`, `python-multipart>=0.0.18`. Network error
+messages no longer leak raw exception text (`Connection failed`/`Unexpected error during fetch`
+instead of forwarding `str(exc)`) — the full exception is still logged server-side.
+
+Also fixes `/api/stats` reporting a $0/zero monthly PyPI download count when the `/overall`
+downloads breakdown was present but unsummed.
+
+## [4.18.1] — 2026-09-17
+
+A community-and-issue-tracker release: three external contributions (LocalBusiness/Organization
+schema subtypes, single-page site About-link anchors, third-party form-embed credit) plus two
+fixes we picked up ourselves from the open issue tracker after the original reporters' proposed
+PRs never landed — the en-dash title-separator bug (#550) and an optional Google SERP + AI
+Overview citation source via serpbase.dev (#527).
+
+### Added
+- **`geo citations --provider serpbase` observes the real Google SERP + AI Overview directly.** Google AI Overviews was the one README-listed platform `geo citations` couldn't observe — it's a SERP feature, not an LLM you can prompt. The new `serp_provider.py` module queries [serpbase.dev](https://serpbase.dev/docs) and checks brand mentions/domain citations against the organic results and the AI Overview block (when Google renders one for the query), reusing the existing `CitationCheckEntry` shape with `platform="google_serp"`. Opt-in, bring-your-own-key (`SERPBASE_API_KEY`, 100 free searches then $0.30/1k) — never part of the default provider auto-detection. `--runs` is not honored for this provider (a SERP isn't resampled the way a non-deterministic LLM answer is), and the undocumented `ai_overview` block is parsed defensively with its presence rate logged rather than assumed (#527).
+
+### Fixed
+- **Brand-name consistency ignored the en dash and cut titles at the wrong separator.** `audit_brand_entity()` cut H1/`<title>`/`og:title` at the first separator found in a fixed tuple `(" — ", " - ", " | ", " · ")`, in tuple order rather than text position. The en dash (`" – "`, U+2013) — a common title separator in German/French/other European typography — wasn't in the list at all, so titles built with it were compared as whole sentences instead of brand names, and even after adding it, a title like `"Acme – Tools for makers | Blog"` would still cut at `" | "` first because it came earlier in the tuple. Both checks now go through a shared `_cut_at_first_separator()` helper that includes the en dash and cuts at whichever separator occurs earliest in the actual text. Reported with a full reproduction by @Dirk2070 (#550).
+- **Contact forms embedded via a third-party provider always scored as "no accessible form."** The agent-usable-forms check in `audit_webmcp.py` only inspected `soup.find_all("form")` — native `<form>` elements in the fetched HTML. A very common small-business pattern (Tally, Typeform, HubSpot, JotForm, Google Forms, ...) puts the actual form fields inside a cross-origin `<iframe>`, on a page this static fetch never touches, so it was always scored as missing — even though these providers build accessible (labeled) markup into their hosted forms by default. Adds `KNOWN_FORM_EMBED_HOSTS` in `models/config.py`; a matching iframe (checked against both `src` and any `data-*-src` attribute, since some embed snippets like Tally's leave `src` empty until a loader script runs) is now credited toward `has_labeled_forms` via a new `has_embedded_form_provider` flag on `WebMcpResult`, same pattern as the existing `has_webmcp_declaration` fallback for JS-invisible signals. Contributed by @slconrad.
+- **The About-link check missed single-page sites entirely.** `ABOUT_LINK_PATTERNS` in `models/config.py` only listed `/`-prefixed URL paths (`/about`, `/chi-siamo`, `/team`, ...), so a single-page marketing site — which has no dedicated About URL, only a same-page section like `<a href="#about">About</a>` — always failed the check, even with a permanently visible About link in its nav. Added the `#`-prefixed anchor equivalent of every existing pattern; the substring match already in place picks these up with no other code changes needed. Contributed by @slconrad.
+- **Organization schema went unrecognized on every LocalBusiness site.** `audit_schema.py` and `audit_brand.py` both matched the JSON-LD `@type` against the literal string `"Organization"` only, so a node typed `"LocalBusiness"` — schema.org's own recommended, more specific type for exactly the small-business audience this tool targets — scored as having no Organization schema at all, and its `telephone`/`email`/`address`/`contactPoint` fields were never credited toward `has_contact_info`, even when present. Same fix shape as `ARTICLE_TYPES`/#392: a new `ORGANIZATION_TYPES` frozenset in `models/config.py` covers `LocalBusiness` plus ~25 of its and Organization's own common subtypes (`Restaurant`, `Store`, `ProfessionalService`, `Dentist`, `Attorney`, etc.), and both checks now match against it instead of the bare string. Contributed by @slconrad.
+
+---
+
+## [4.18.0] — 2026-09-12 · Quorum
+
+A sampling-and-false-negatives release: `geo citations` can ask each query multiple
+times and report a confidence interval instead of trusting a single coin flip,
+prompt-injection detection learns to recognize legitimate UGC regions instead of
+just flagging them, and three checks (CJK word counts, negative-signal DOM
+scoping, brand-last entity titles) stop under-counting content that was always
+there.
+
+### Added
+- **`geo citations --runs N` samples each query multiple times.** AI answers are non-deterministic — the same question returns different sources run to run (Schulte et al. 2026, arXiv:2604.07585). A one-shot check is a coin flip. `--runs 5` asks each query five times, reports a 95% Wilson confidence interval on the citation rate, and marks the verdict `stable` only when that interval does not straddle a verdict boundary. `--runs 1` (default) is unchanged and byte-for-byte backwards compatible; the new `CitationCheckResult` fields (`runs_per_query`, `total_answers`, `*_rate_ci`, `stable`) all default to the previous behaviour.
+- **UGC injection-surface detection.** `audit_prompt_injection` now flags comment / review / forum regions — Disqus, Facebook Comments, giscus/utterances, WordPress comment lists, `schema.org/Comment` and repeated `itemprop="review"` markup. A UGC area is not an injection by itself, so it does not change the severity or risk level; it is surfaced as an advisory. When an injection pattern *is* found and a UGC region is present (`ugc_injection_risk`), the recommendation escalates to "the payload may be third-party content — moderate the UGC area, mark its links `rel=ugc`, consider excluding unmoderated UGC from AI crawlers" (Deep-Research Agents Can Be Poisoned via User-Generated Content, arXiv:2605.24245).
+
+### Fixed
+- **`entity_disambiguation` failed every title ending in the brand name (#537-adjacent, no tracking issue).** Three compounding bugs: it kept only the title segment *before* the first separator, so the common "Page Name — Brand" convention never exposed the brand at all; it stopped at the first JSON-LD `name` on an `@graph`, usually the company rather than the product; and it took `max()` over each entity's `sameAs` list instead of summing them, so links spread across `Organization` and `Person` never reached the >3 bonus. Consistency now holds when *any* schema name matches *any* title segment (either containment direction); with no schema name to anchor to, title and `og:title` must still agree, covered by a regression test so the fix cannot over-reach. Verified live on geoready.dev's homepage: `entity_disambiguation` 1/3 → 2/3, `sameas_count` 4 → 6.
+- **The entity-definition check read the page's nav menu, not its content.** It took the first `<p>` of the whole `<body>` — on any site whose header is built out of paragraphs, that is a menu label ("Pricing — plans from $0"), so the opening sentence describing the brand was never examined and the point was unreachable regardless of the copy. Now scoped to `<main>`/`<article>` (the same pattern `detect_easy_to_understand` already uses) and scans the first three paragraphs, since a hero commonly opens with a short eyebrow line before the sentence that actually defines the product.
+- **CJK content was under-counted ~10× by every word-count gate (#537).** `audit_content.py` and `audit_llms.py` measured length with `str.split()`, which counts whitespace-delimited tokens — but Chinese, Japanese and Korean text has no inter-word spaces, so a normal-length Chinese article measured as a handful of "words". Concretely: the `content_word_count` credit (≥300 words) and `content_front_loading` credit were arithmetically unreachable for a CJK page whose English translation passes both comfortably — the 50-token front-loading floor sat above the entire measured length. A new `utils/text.py` tokenizer counts each CJK codepoint (Han, Hiragana, Katakana, Hangul, half-width Katakana) as one word-like unit alongside normal whitespace tokens; for text with no CJK codepoints it returns byte-for-byte the same result as `str.split()`, so Latin-script scoring is unchanged. Reported with reproductions by @isafesoft.
+- **`audit_negative_signals` read the raw DOM instead of the shared cleaned tree (#537).** It was the one audit module still calling `soup.get_text()` on the un-stripped soup; every other module uses the `soup_clean` the orchestrator already builds. It now takes `soup_clean` and uses it for keyword-stuffing density, CTA density and the boilerplate ratio — so an inline stylesheet (on a bs4 build old enough to include `<style>` text in `get_text()`) or a large `<noscript>` fallback menu can no longer be mistaken for keyword-stuffed page copy. The shared `soup_clean` now also strips `<noscript>` and `<template>`, whose text is never page copy but which `get_text()` still returns.
+
+### Changed
+- The `/methodology` page now cites the 2026 GEO survey (arXiv:2607.14035), C-SEO Bench (arXiv:2506.11097) and Schulte et al. (arXiv:2604.07585) alongside the Princeton and AutoGEO papers, and notes that a deterministic score and a non-deterministic live citation check are two different measurements.
+
+---
+
 ## [4.17.1] — 2026-08-31
 
 Patch release from a dogfooding sweep against this project's own production

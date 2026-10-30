@@ -13,14 +13,22 @@ from collections import Counter
 from geo_optimizer.models.config import (
     BOILERPLATE_RATIO_THRESHOLD,
     CONTENT_MIN_WORDS,
+    KEYWORD_STUFFING_MIN_COUNT,
     KEYWORD_STUFFING_THRESHOLD,
     MIXED_SIGNALS_WORD_THRESHOLD,
 )
 from geo_optimizer.models.results import ContentResult, MetaResult, NegativeSignalsResult, SchemaResult
+from geo_optimizer.utils.jsonld import schema_types as jsonld_types
+from geo_optimizer.utils.stopwords import brand_words, page_language, stop_words_for
 
 
 def audit_negative_signals(
-    soup, raw_html, content_result: ContentResult, meta_result: MetaResult, schema_result: SchemaResult
+    soup,
+    raw_html,
+    content_result: ContentResult,
+    meta_result: MetaResult,
+    schema_result: SchemaResult,
+    soup_clean=None,
 ) -> NegativeSignalsResult:
     """Detect negative signals that reduce AI citability.
 
@@ -33,6 +41,10 @@ def audit_negative_signals(
         content_result: Already-computed ContentResult.
         meta_result: Already-computed MetaResult.
         schema_result: Already-computed SchemaResult.
+        soup_clean: (optional) BeautifulSoup with script/style/noscript/template
+            removed. Used for all text extraction so stylesheet, inline-script
+            and <noscript> fallback text never count as page copy (#537). Falls
+            back to ``soup`` when not provided.
 
     Returns:
         NegativeSignalsResult with detected negative signals.
@@ -43,6 +55,10 @@ def audit_negative_signals(
 
     result.checked = True
 
+    # Text extraction runs on the cleaned tree when available; DOM-structure
+    # checks (popups, broken links, author markup) stay on the raw ``soup``.
+    text_soup = soup_clean if soup_clean is not None else soup
+
     # ── 1. CTA density (self-promotional) ───────────────────────
     # Aggressive CTA patterns
     cta_patterns = re.compile(
@@ -51,7 +67,7 @@ def audit_negative_signals(
         r"prova gratis|acquista|registrati|offerta limitata)\b",
         re.IGNORECASE,
     )
-    text = soup.get_text(separator=" ", strip=True)
+    text = text_soup.get_text(separator=" ", strip=True)
     cta_matches = cta_patterns.findall(text)
     result.cta_count = len(cta_matches)
     # > 5 CTAs on a page = excessive
@@ -102,71 +118,22 @@ def audit_negative_signals(
     result.has_broken_links = broken_count > 3
 
     # ── 5. Keyword stuffing ──────────────────────────────────────
-    # Calculate word frequency (excluding stop words and short words)
-    stop_words = {
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "was",
-        "were",
-        "be",
-        "been",
-        "and",
-        "or",
-        "but",
-        "in",
-        "on",
-        "at",
-        "to",
-        "for",
-        "of",
-        "with",
-        "it",
-        "this",
-        "that",
-        "not",
-        "no",
-        "as",
-        "by",
-        "from",
-        "il",
-        "la",
-        "le",
-        "lo",
-        "gli",
-        "un",
-        "una",
-        "di",
-        "da",
-        "del",
-        "che",
-        "per",
-        "con",
-        "su",
-        "al",
-        "dei",
-        "nel",
-        "è",
-        "sono",
-        "ha",
-        "hanno",
-        "più",
-        "anche",
-        "come",
-        "se",
-        "non",
-        "i",
-    }
-    words = re.findall(r"\b[a-zA-ZÀ-ÿ]{4,}\b", text.lower())
-    if len(words) > 50:
-        freq = Counter(w for w in words if w not in stop_words)
+    # Runs on `text` (from text_soup), so SSR'd CSS-in-JS <style> blocks and
+    # inline scripts cannot inflate token frequency (#537). Note: the word
+    # regex below is Latin-only, so CJK pages get no stuffing detection yet.
+    # Function words of the page language and the page's own brand are not keywords (#607).
+    # A declared language without a list skips the check rather than counting its function words.
+    stop_words = stop_words_for(page_language(soup))
+    # Any Unicode letter (not just Latin), so non-Latin pages are not measured on a shrunken denominator
+    words = re.findall(r"\b[^\W\d_]{4,}\b", text.lower())
+    if stop_words is not None and len(words) > 50:
+        excluded = stop_words | brand_words(soup)
+        freq = Counter(w for w in words if w not in excluded)
         total = len(words)
         for word, count in freq.most_common(3):
             density = count / total
             # Single-word density above threshold (SEMrush 2025: > 2.5%) = stuffing
-            if density > KEYWORD_STUFFING_THRESHOLD and count >= 5:
+            if density > KEYWORD_STUFFING_THRESHOLD and count >= KEYWORD_STUFFING_MIN_COUNT:
                 result.has_keyword_stuffing = True
                 result.stuffed_word = word
                 result.stuffed_density = round(density * 100, 1)
@@ -179,10 +146,7 @@ def audit_negative_signals(
     for raw_schema in schema_result.raw_schemas:
         schemas_to_check = _flatten_graph(raw_schema) if isinstance(raw_schema, dict) else []
         for s in schemas_to_check:
-            s_type = s.get("@type", "")
-            if isinstance(s_type, list):
-                s_type = s_type[0] if s_type else ""
-            if s_type == "Person":
+            if "Person" in jsonld_types(s.get("@type")):
                 result.has_author_signal = True
                 break
             # nested author
@@ -199,19 +163,24 @@ def audit_negative_signals(
         result.has_author_signal = True
 
     # ── 7. Boilerplate ratio ─────────────────────────────────────
-    # Content in <main>, <article>, role="main" vs total
-    main_content = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
+    # Content in <main>, <article>, role="main" vs total. Runs on text_soup so
+    # the ratio is not skewed by stylesheet/script/noscript text (#537).
+    main_content = text_soup.find("main") or text_soup.find("article") or text_soup.find(attrs={"role": "main"})
     total_text_len = len(text)
     if main_content and total_text_len > 0:
         main_text_len = len(main_content.get_text(separator=" ", strip=True))
         result.boilerplate_ratio = round(1.0 - (main_text_len / total_text_len), 2)
     elif total_text_len > 0:
-        # No <main>/<article> — estimate from nav+footer
+        # No <main>/<article> — estimate from nav+footer. Only the outermost
+        # region counts: a <nav> inside a <header> was counted twice, which
+        # pushed the ratio above 1.0.
+        chrome = ["nav", "footer", "header"]
         nav_footer_len = 0
-        for tag in soup.find_all(["nav", "footer", "header"]):
-            nav_footer_len += len(tag.get_text(separator=" ", strip=True))
+        for tag in text_soup.find_all(chrome):
+            if tag.find_parent(chrome) is None:
+                nav_footer_len += len(tag.get_text(separator=" ", strip=True))
         if nav_footer_len > 0:
-            result.boilerplate_ratio = round(nav_footer_len / total_text_len, 2)
+            result.boilerplate_ratio = round(min(nav_footer_len / total_text_len, 1.0), 2)
     result.boilerplate_high = result.boilerplate_ratio > BOILERPLATE_RATIO_THRESHOLD
 
     # ── 8. Mixed signals ─────────────────────────────────────────

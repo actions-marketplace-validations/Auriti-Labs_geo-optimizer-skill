@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Research Foundation — GEO Optimizer</title>
-<meta name="description" content="GEO Optimizer is built on peer-reviewed academic research. Princeton KDD 2024, AutoGEO ICLR 2026, and more.">
+<meta name="description" content="GEO Optimizer is built on published research: Princeton KDD 2024, the AutoGEO preprint (arXiv:2510.11438), and more.">
 <link rel="canonical" href="https://geoready.dev/research">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Research Foundation — GEO Optimizer">
-<meta property="og:description" content="GEO Optimizer is built on peer-reviewed academic research. Princeton KDD 2024, AutoGEO ICLR 2026, and more.">
+<meta property="og:description" content="GEO Optimizer is built on published research: Princeton KDD 2024, the AutoGEO preprint (arXiv:2510.11438), and more.">
 <meta property="og:url" content="https://geoready.dev/research">
 <meta property="og:image" content="https://geoready.dev/assets/og-image.png">
 <meta property="og:image:width" content="1200">
@@ -128,7 +128,7 @@ footer a{color:var(--text-muted)}
     <div class="nav-links">
       <a href="/">Audit</a>
       <a href="/compare">Compare</a>
-      <a href="https://auriti-labs.github.io/geo-optimizer-skill/">Docs</a>
+      <a href="https://geoready.dev/docs/">Docs</a>
       <span class="nav-sep"></span>
       <div class="nav-dropdown">
         <button class="nav-dropdown-toggle" aria-expanded="false">More <svg viewBox="0 0 10 6" xmlns="http://www.w3.org/2000/svg"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
@@ -145,31 +145,25 @@ footer a{color:var(--text-muted)}
       <span class="star-count" id="nav-stars"></span>
     </a>
   </nav>
-  <div class="hero"><h1>Research Foundation</h1><p>Built on peer-reviewed science, not marketing claims.</p></div>
+  <div class="hero"><h1>Research Foundation</h1><p>Built on published research. The KDD 2024 paper is peer-reviewed; AutoGEO is an arXiv preprint.</p></div>
 
   <div class="paper">
     <h2>GEO: Generative Engine Optimization</h2>
     <div class="venue">KDD 2024 &mdash; Princeton, Georgia Tech, AI2, IIT Delhi</div>
-    <div class="finding">Tested 9 optimization strategies across 10,000 queries on GEO-bench. Validated on real Perplexity.ai with 22-37% improvements.</div>
-    <div class="impact"><strong>Key:</strong> Citations increase AI visibility up to +115%. Statistics add +40%. Keyword stuffing has ~0% effect.</div>
+    <div class="finding">Tested nine content-optimization methods on GEO-bench (10,000 queries) and reported visibility gains of up to about 40% in generative-engine responses.</div>
+    <div class="impact"><strong>Key:</strong> Relative gains in a visibility metric on the authors' benchmark (top-5 Google results fed to gpt-3.5-turbo), not citation rates. Keyword stuffing did not perform well.</div>
     <div class="methods">
-      <div class="method">Cite Sources <span class="pct">+27-115%</span></div>
-      <div class="method">Quotations <span class="pct">+41%</span></div>
-      <div class="method">Statistics <span class="pct">+33%</span></div>
-      <div class="method">Fluency <span class="pct">+29%</span></div>
-      <div class="method">Technical Terms <span class="pct">+18%</span></div>
-      <div class="method">Authority <span class="pct">+16%</span></div>
-      <div class="method">Readability <span class="pct">+14%</span></div>
-      <div class="method">Unique Words <span class="pct">+7%</span></div>
-      <div class="method">Keyword Stuffing <span class="neg">~0%</span></div>
+      <div class="method">Quotation addition <span class="pct">+41% (position-adjusted word count)</span></div>
+      <div class="method">Statistics addition <span class="pct">+33% (word count)</span></div>
+      <div class="method">Keyword Stuffing <span class="neg">did not perform well</span></div>
     </div>
     <a class="link" href="https://arxiv.org/abs/2311.09735">Read paper &rarr;</a>
   </div>
 
   <div class="paper">
     <h2>AutoGEO: Automatic Generative Engine Optimization</h2>
-    <div class="venue">ICLR 2026 &mdash; Carnegie Mellon University</div>
-    <div class="finding">Automatic rule extraction from generative engines via LLMs + reinforcement learning. +50.99% over Princeton baseline. Introduces GEU (utility) metric.</div>
+    <div class="venue">arXiv preprint, 2025 &mdash; Carnegie Mellon University</div>
+    <div class="finding">Automatic rule extraction from generative engines via LLMs + reinforcement learning. Average improvement of about 36% over the strongest Princeton method. Introduces GEU (utility) metric.</div>
     <div class="impact"><strong>How we use it:</strong> Informs scoring weight updates. Answer-first structure and passage density checks are based on AutoGEO findings.</div>
     <a class="link" href="https://arxiv.org/abs/2510.11438">Read paper &rarr;</a>
   </div>
@@ -205,7 +199,7 @@ footer a{color:var(--text-muted)}
 
   <div class="disclaimer">GEO Optimizer focuses on <strong>infrastructure optimization</strong> (robots.txt, llms.txt, schema, meta, content structure) &mdash; not content manipulation. The adversarial research confirms that manipulative techniques degrade the ecosystem.</div>
 
-  <footer><a href="https://github.com/auriti-labs/geo-optimizer-skill">GitHub</a> &middot; <a href="https://auriti-labs.github.io/geo-optimizer-skill/">Docs</a> &middot; <a href="https://pypi.org/project/geo-optimizer-skill/">PyPI</a></footer>
+  <footer><a href="https://github.com/auriti-labs/geo-optimizer-skill">GitHub</a> &middot; <a href="https://geoready.dev/docs/">Docs</a> &middot; <a href="https://pypi.org/project/geo-optimizer-skill/">PyPI</a></footer>
 </div>
 <script__NONCE_ATTR__>
 fetch('/api/stats').then(function(r){return r.json()}).then(function(d){var ns=document.getElementById('nav-stars');if(ns&&d.github_stars)ns.textContent='★ '+d.github_stars}).catch(function(){});

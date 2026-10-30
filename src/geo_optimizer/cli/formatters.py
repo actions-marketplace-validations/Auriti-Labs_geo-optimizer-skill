@@ -10,11 +10,16 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from html import escape
+from typing import Any
 from urllib.parse import quote
 
 from geo_optimizer.cli.scoring_helpers import (
+    ai_discovery_score as _ai_discovery_score,
+)
+from geo_optimizer.cli.scoring_helpers import (
     brand_entity_score as _brand_entity_score,
 )
+from geo_optimizer.cli.scoring_helpers import categories, category_max, category_score
 from geo_optimizer.cli.scoring_helpers import (
     content_score as _content_score,
 )
@@ -33,7 +38,7 @@ from geo_optimizer.cli.scoring_helpers import (
 from geo_optimizer.cli.scoring_helpers import (
     signals_score as _signals_score,
 )
-from geo_optimizer.models.config import SCORE_BANDS, SCORING
+from geo_optimizer.models.config import SCORE_BANDS
 from geo_optimizer.models.results import (
     AnswerSnapshot,
     AnswerSnapshotArchive,
@@ -45,20 +50,10 @@ from geo_optimizer.models.results import (
     MonitorResult,
 )
 
-# Fix #409: max scores computed dynamically from SCORING (not hardcoded)
-_MAX_ROBOTS = sum(v for k, v in SCORING.items() if k.startswith("robots_"))
-_MAX_LLMS = sum(v for k, v in SCORING.items() if k.startswith("llms_"))
-_MAX_SCHEMA = sum(v for k, v in SCORING.items() if k.startswith("schema_"))
-_MAX_META = sum(v for k, v in SCORING.items() if k.startswith("meta_"))
-_MAX_CONTENT = sum(v for k, v in SCORING.items() if k.startswith("content_"))
-_MAX_SIGNALS = sum(v for k, v in SCORING.items() if k.startswith("signals_"))
-_MAX_AI_DISC = sum(v for k, v in SCORING.items() if k.startswith("ai_discovery_"))
-_MAX_BRAND = sum(v for k, v in SCORING.items() if k.startswith("brand_"))
-
 
 def format_audit_json(result: AuditResult) -> str:
     """Format AuditResult as JSON string."""
-    data = {
+    data: dict[str, Any] = {
         "url": result.url,
         "timestamp": result.timestamp,
         "score": result.score,
@@ -69,22 +64,25 @@ def format_audit_json(result: AuditResult) -> str:
         # result. A script parsing this output must check this field before
         # trusting score/checks.
         "error": result.error,
+        "score_version": result.score_version,
+        "score_max": {cat: category_max(result, cat) for cat in categories(result)},
+        "google_ai": asdict(result.google_ai),
         "checks": {
             "robots_txt": {
                 "score": _robots_score(result),
-                "max": _MAX_ROBOTS,
+                "max": category_max(result, "robots"),
                 "passed": result.robots.citation_bots_ok,
                 "details": asdict(result.robots),
             },
             "llms_txt": {
                 "score": _llms_score(result),
-                "max": _MAX_LLMS,
+                "max": category_max(result, "llms"),
                 "passed": result.llms.found and result.llms.has_h1,
                 "details": asdict(result.llms),
             },
             "schema_jsonld": {
                 "score": _schema_score(result),
-                "max": _MAX_SCHEMA,
+                "max": category_max(result, "schema"),
                 "passed": result.schema.has_website,
                 "details": {
                     "has_website": result.schema.has_website,
@@ -95,38 +93,47 @@ def format_audit_json(result: AuditResult) -> str:
             },
             "meta_tags": {
                 "score": _meta_score(result),
-                "max": _MAX_META,
+                "max": category_max(result, "meta"),
                 "passed": result.meta.has_title and result.meta.has_description,
                 "details": asdict(result.meta),
             },
             "content": {
                 "score": _content_score(result),
-                "max": _MAX_CONTENT,
+                "max": category_max(result, "content"),
                 "passed": result.content.has_h1,
                 "details": asdict(result.content),
             },
             "signals": {
                 "score": _signals_score(result),
-                "max": _MAX_SIGNALS,
+                "max": category_max(result, "signals"),
                 "passed": bool(result.signals and result.signals.has_lang),
                 "details": asdict(result.signals) if result.signals else {},
             },
             "ai_discovery": {
-                "score": result.score_breakdown.get("ai_discovery", 0),
-                "max": _MAX_AI_DISC,
+                "score": _ai_discovery_score(result),
+                "max": category_max(result, "ai_discovery"),
                 "passed": bool(result.ai_discovery and result.ai_discovery.endpoints_found >= 1),
                 "details": asdict(result.ai_discovery) if result.ai_discovery else {},
             },
             "brand_entity": {
                 "score": _brand_entity_score(result),
-                "max": _MAX_BRAND,
+                "max": category_max(result, "brand_entity"),
                 "passed": bool(result.brand_entity and result.brand_entity.brand_name_consistent),
                 "details": asdict(result.brand_entity) if result.brand_entity else {},
             },
         },
         "score_breakdown": result.score_breakdown,
         "recommendations": result.recommendations,
+        # Additive (same schema): the same strings grouped by the category that produced them
+        "recommendations_by_category": result.recommendations_by_category,
     }
+    if "google_ai" in result.score_max:
+        data["checks"]["google_ai"] = {
+            "score": category_score(result, "google_ai"),
+            "max": category_max(result, "google_ai"),
+            "passed": not any(check.status == "fail" for check in result.google_ai.checks),
+            "details": asdict(result.google_ai),
+        }
 
     # WebMCP Readiness (#233) — separate informational section
     if hasattr(result, "webmcp") and result.webmcp.checked:
@@ -264,7 +271,10 @@ def format_audit_text(result: AuditResult) -> str:
 
     # llms.txt
     lines.append("")
-    lines.append(_section_header("2. LLMS.TXT — AI Index File"))
+    llms_label = "2. LLMS.TXT — AI Index File"
+    if result.score_version >= 2:
+        llms_label += " (Other AI agents · not used by Google Search)"
+    lines.append(_section_header(llms_label))
     if not result.llms.found:
         lines.append("  ❌ llms.txt not found — essential for AI indexing!")
     else:
@@ -369,10 +379,11 @@ def format_audit_text(result: AuditResult) -> str:
         lines.append(_section_header("8. BRAND & ENTITY SIGNALS"))
         be = result.brand_entity
         be_pts = _brand_entity_score(result)
-        bar_filled = int(be_pts / 2)
+        be_max = category_max(result, "brand_entity")
+        bar_filled = int(be_pts / be_max * 5) if be_max else 0
         bar_empty = 5 - bar_filled
         bar = "█" * bar_filled + "░" * bar_empty
-        lines.append(f"  [{bar}] {be_pts}/10")
+        lines.append(f"  [{bar}] {be_pts}/{be_max}")
         if be.brand_name_consistent:
             names = ", ".join(be.names_found[:3]) if be.names_found else ""
             lines.append(f"  ✅ Brand name consistent{f' ({names})' if names else ''}")
@@ -441,11 +452,16 @@ def format_audit_text(result: AuditResult) -> str:
             lines.append(f"  ⚠️  Data attribute injection: {pi.data_attr_injection_count} found")
         if pi.aria_hidden_injection_found:
             lines.append(f"  ❌ aria-hidden injection: {pi.aria_hidden_injection_count} found")
+        if pi.ugc_surface_found:
+            icon = "❌" if pi.ugc_injection_risk else "ℹ️ "
+            note = " — injection found here, may be third-party UGC" if pi.ugc_injection_risk else ""
+            lines.append(f"  {icon} UGC injection surface: {', '.join(pi.ugc_surface_samples[:3])}{note}")
 
     # Trust Stack Score (#273)
     if result.trust_stack and result.trust_stack.checked:
         lines.append("")
         lines.append(_section_header("12. TRUST STACK SCORE"))
+        lines.append(_NOT_SCORED)
         ts = result.trust_stack
         lines.append(f"  Grade: {ts.grade} ({ts.composite_score}/25) — Trust level: {ts.trust_level}")
         for layer in [ts.technical, ts.identity, ts.social, ts.academic, ts.consistency]:
@@ -458,6 +474,7 @@ def format_audit_text(result: AuditResult) -> str:
     if result.rag_chunk and result.rag_chunk.checked and result.rag_chunk.total_sections > 0:
         lines.append("")
         lines.append(_section_header("13. RAG CHUNK READINESS"))
+        lines.append(_NOT_SCORED)
         rc = result.rag_chunk
         lines.append(f"  Sections: {rc.total_sections} ({rc.sections_in_range} in 100-150 word range)")
         lines.append(f"  Avg section words: {rc.avg_section_words}")
@@ -476,6 +493,7 @@ def format_audit_text(result: AuditResult) -> str:
     if ep and ep.checked:
         lines.append("")
         lines.append(_section_header("14. EMBEDDING PROXIMITY"))
+        lines.append(_NOT_SCORED)
         if ep.skipped_reason:
             lines.append(f"  ⏭️  Skipped: {ep.skipped_reason}")
         else:
@@ -488,6 +506,7 @@ def format_audit_text(result: AuditResult) -> str:
     if cd and cd.checked and cd.signals:
         lines.append("")
         lines.append(_section_header("15. CONTENT DECAY PREDICTION"))
+        lines.append(_NOT_SCORED)
         risk_icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(cd.decay_risk, "⚪")
         lines.append(f"  Risk: {risk_icon} {cd.decay_risk.upper()} | Evergreen: {cd.evergreen_score}/100")
         if cd.earliest_decay_days is not None:
@@ -500,6 +519,7 @@ def format_audit_text(result: AuditResult) -> str:
     if pc and pc.checked and pc.platforms:
         lines.append("")
         lines.append(_section_header("16. PLATFORM CITATION PROFILE"))
+        lines.append(_NOT_SCORED)
         for p in pc.platforms:
             lines.append(f"  {p.platform.upper()}: {p.score}/100")
             for s in p.strengths[:3]:
@@ -512,6 +532,7 @@ def format_audit_text(result: AuditResult) -> str:
     if cw and cw.checked and cw.total_words > 0:
         lines.append("")
         lines.append(_section_header("17. CONTEXT WINDOW OPTIMIZATION"))
+        lines.append(_NOT_SCORED)
         risk_icon = {"high": "🔴", "medium": "🟡", "low": "🟢", "none": "⚪"}.get(cw.truncation_risk, "⚪")
         lines.append(f"  Tokens: ~{cw.total_tokens_estimate} ({cw.total_words} words)")
         lines.append(f"  Front-loading: {cw.front_loaded_ratio:.0%} | Filler: {cw.filler_ratio:.0%}")
@@ -524,6 +545,7 @@ def format_audit_text(result: AuditResult) -> str:
     if ir and ir.checked and ir.readiness_level != "none":
         lines.append("")
         lines.append(_section_header("18. INSTRUCTION FOLLOWING READINESS"))
+        lines.append(_NOT_SCORED)
         lines.append(
             f"  Actions: {ir.labeled_buttons} labeled, {ir.unlabeled_buttons} unlabeled ({ir.action_clarity_score}/100)"
         )
@@ -540,6 +562,7 @@ def format_audit_text(result: AuditResult) -> str:
     if mm and mm.checked and mm.readiness_level != "none":
         lines.append("")
         lines.append(_section_header("19. MULTIMODAL READINESS"))
+        lines.append(_NOT_SCORED)
         if mm.total_images:
             lines.append(
                 f"  Images: {mm.images_with_alt}/{mm.total_images} with descriptive alt "
@@ -556,6 +579,14 @@ def format_audit_text(result: AuditResult) -> str:
                 f"| transcript: {'✅' if mm.has_transcript else '❌'}"
             )
         lines.append(f"  Readiness: {mm.readiness_level}")
+
+    if result.google_ai.checked:
+        lines.append("")
+        lines.append(_section_header("GOOGLE AI SEARCH"))
+        status_icons = {"pass": "✓", "warn": "⚠", "fail": "✗", "manual": "?"}
+        for check in result.google_ai.checks:
+            icon = status_icons.get(check.status, "?")
+            lines.append(f"  {icon} {check.id}: {check.evidence} ({check.points}/{check.max_points})")
 
     # Score
     lines.append("")
@@ -588,8 +619,14 @@ def format_audit_text(result: AuditResult) -> str:
 
     # CLI→platform funnel: the CLI is one-shot, continuity lives in the platform
     lines.append("")
-    lines.append("  💡 One-shot audit. The free plan at https://geoready.dev tracks 1 domain")
-    lines.append("     with a weekly drift email — plus score history and AI citation tracking.")
+    lines.append("  💡 One-shot audit. The free plan at https://geoready.dev saves your reports and runs")
+    lines.append("     one real AI answer check a week; weekly score monitoring starts on Pro.")
+    # Per-run web-report link: the user's own URL, pre-filled in the free web
+    # audit page. Printed text only — the CLI never opens a browser and never
+    # makes a network call for this (no phone-home: the README FAQ promises it).
+    lines.append("")
+    lines.append("  → Web report for this URL (free, no account):")
+    lines.append(f"     https://geoready.dev/report/audit?url={quote(result.url, safe=':/?&=')}")
 
     # Badge growth loop: only suggest embedding a score worth showing off (gap #501)
     if result.band in ("excellent", "good"):
@@ -653,18 +690,25 @@ def format_batch_audit_text(result: BatchAuditResult) -> str:
     lines.append("")
     lines.append(_section_header("1. CATEGORY AVERAGES"))
     if result.average_score_breakdown:
+        page_reference = next(
+            (page for page in result.pages if not page.error), result.pages[0] if result.pages else None
+        )
         category_labels = {
-            "robots": ("Robots.txt", _MAX_ROBOTS),
-            "llms": ("llms.txt", _MAX_LLMS),
-            "schema": ("Schema", _MAX_SCHEMA),
-            "meta": ("Meta", _MAX_META),
-            "content": ("Content", _MAX_CONTENT),
-            "signals": ("Signals", _MAX_SIGNALS),
-            "ai_discovery": ("AI Discovery", _MAX_AI_DISC),
-            "brand_entity": ("Brand & Entity", _MAX_BRAND),
+            "robots": "Robots.txt",
+            "llms": "llms.txt",
+            "schema": "Schema",
+            "meta": "Meta",
+            "content": "Content",
+            "signals": "Signals",
+            "ai_discovery": "AI Discovery",
+            "brand_entity": "Brand & Entity",
+            "google_ai": "Google AI Search",
         }
         for category, score in result.average_score_breakdown.items():
-            label, max_score = category_labels.get(category, (category.replace("_", " ").title(), 0))
+            label = category_labels.get(category, category.replace("_", " ").title())
+            # I BatchAuditPageResult portano il proprio score_max (per versione
+            # di rubrica): si legge direttamente dalla pagina di riferimento.
+            max_score = page_reference.score_max.get(category, 0) if page_reference else 0
             suffix = f"/{max_score}" if max_score else ""
             lines.append(f"  • {label}: {score:.2f}{suffix}")
     else:
@@ -715,6 +759,7 @@ def format_audit_diff_json(result: AuditDiffResult) -> str:
         "before_recommendations_count": result.before_recommendations_count,
         "after_recommendations_count": result.after_recommendations_count,
         "recommendations_delta": result.recommendations_delta,
+        "version_mismatch": result.version_mismatch,
         "category_deltas": [asdict(item) for item in result.category_deltas],
         "improved_categories": [asdict(item) for item in result.improved_categories],
         "regressed_categories": [asdict(item) for item in result.regressed_categories],
@@ -737,6 +782,8 @@ def format_audit_diff_text(result: AuditDiffResult) -> str:
     lines.append("")
     lines.append(f"   Before: {result.before_url}")
     lines.append(f"   After:  {result.after_url}")
+    if result.version_mismatch:
+        lines.append("   ⚠️  scores use different rubric versions")
     lines.append("")
     lines.append(
         "   "
@@ -1062,6 +1109,11 @@ def format_citation_quality_text(result: CitationQualityReport) -> str:
         lines.append(f"    {entry.context_snippet}")
 
     return "\n".join(lines)
+
+
+# Sections 12-19 are diagnostics. Readers took a high "Chunk readiness" next to
+# the total as part of it, so each one says it is outside the score.
+_NOT_SCORED = "  ℹ️  Diagnostic only: not part of the 0-100 GEO score"
 
 
 def _section_header(text: str) -> str:

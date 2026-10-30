@@ -160,6 +160,29 @@ def _call_audit_result_to_dict(result):
     return app_module._audit_result_to_dict(result)
 
 
+def test_web_api_llms_exposes_blocked_by_cdn():
+    """`checks.llms_txt` must expose blocked_by_cdn and validation_warnings.
+
+    The SaaS platform consumes this serialization to decide the llms.txt
+    recommendation; a CDN/WAF block (v4.18.3) must be visible so the platform
+    does not tell the user to "create" a file that may already exist behind
+    the WAF.
+    """
+    from geo_optimizer.models.results import LlmsTxtResult
+
+    result = _make_minimal_audit_result()
+    result.llms = LlmsTxtResult(
+        found=False,
+        blocked_by_cdn=True,
+        validation_warnings=["llms.txt may exist but CDN/WAF returned 403"],
+    )
+
+    data = _call_audit_result_to_dict(result)
+    llms_txt = data["checks"]["llms_txt"]
+    assert llms_txt["blocked_by_cdn"] is True
+    assert "CDN/WAF" in llms_txt["validation_warnings"][0]
+
+
 def test_web_api_has_schema_version():
     """Web API JSON response must include schema_version: 1."""
     result = _make_minimal_audit_result()
@@ -277,3 +300,65 @@ def test_fixture_file_exists():
     assert _FIXTURE_PATH.exists(), f"Fixture not found: {_FIXTURE_PATH}"
     fixture = json.loads(_FIXTURE_PATH.read_text())
     assert fixture["_contract_version"] == 1
+
+
+def test_web_api_score_breakdown_follows_result_rubric_version():
+    """Un risultato v2 espone google_ai nel breakdown e i massimi v2 in score_max."""
+    from geo_optimizer.models.config import CATEGORY_MAX_V2
+
+    result = _make_minimal_audit_result()
+    result.score_version = 2
+    result.score_max = dict(CATEGORY_MAX_V2)
+    result.score_breakdown = {"google_ai": 15, "robots": 10}
+    data = _call_audit_result_to_dict(result)
+    assert data["score_breakdown"]["google_ai"] == 15
+    assert set(data["score_breakdown"]) == set(CATEGORY_MAX_V2)
+    assert data["score_max"] == CATEGORY_MAX_V2
+
+
+def test_web_api_exposes_score_penalty_outside_breakdown():
+    """La penalità è una chiave top-level: score_breakdown resta di sole categorie."""
+    result = _make_minimal_audit_result()
+    result.score_breakdown = {"robots": 14, "meta": 11, "negative_penalty": -3}
+    result.score = 22
+
+    data = _call_audit_result_to_dict(result)
+
+    assert data["score_penalty"] == -3
+    assert "negative_penalty" not in data["score_breakdown"]
+    assert sum(data["score_breakdown"].values()) + data["score_penalty"] == data["score"]
+
+
+def test_web_api_score_penalty_defaults_to_zero():
+    result = _make_minimal_audit_result()
+    result.score_breakdown = {"robots": 14}
+
+    data = _call_audit_result_to_dict(result)
+
+    assert data["score_penalty"] == 0
+
+
+def test_cli_json_breakdown_keeps_negative_penalty():
+    """Il JSON della CLI riporta gia' la penalita' dentro score_breakdown: niente chiave duplicata."""
+    from geo_optimizer.cli.formatters import format_audit_json
+
+    result = _make_minimal_audit_result()
+    result.score_breakdown = {"robots": 14, "negative_penalty": -5}
+    result.score = 9
+
+    data = json.loads(format_audit_json(result))
+
+    assert data["score_breakdown"]["negative_penalty"] == -5
+    assert "score_penalty" not in data
+
+
+def test_web_api_score_penalty_with_clamp_at_zero():
+    """Categorie a 0 e penalita' -1: score resta 0 (clamp documentato nel contratto)."""
+    result = _make_minimal_audit_result()
+    result.score_breakdown = {"robots": 0, "negative_penalty": -1}
+    result.score = 0
+
+    data = _call_audit_result_to_dict(result)
+
+    assert data["score_penalty"] == -1
+    assert max(0, min(100, sum(data["score_breakdown"].values()) + data["score_penalty"])) == data["score"]

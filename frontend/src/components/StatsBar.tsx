@@ -12,24 +12,72 @@ function fmt(n: number): string {
   return String(n);
 }
 
-// Static fallback shown until /stats responds. github_stars verified via GitHub API on 2026-07-15.
-const FALLBACK: Stats = { github_stars: 587, pypi_downloads_month: 5134, audits_run: 1593 };
+// I valori iniziali arrivano dal build (vedi utils/publicStats.ts): così l'HTML servito a
+// un crawler AI porta già i contatori aggiornati, invece del vecchio fallback statico che
+// dichiarava 5.134 download/mese contro i 71.997 reali. Il fetch qui sotto resta perché
+// aggiorna i numeri nel browser fra un rebuild e l'altro.
+interface StatsBarProps {
+  initial?: Stats;
+  /** true = i valori iniziali vengono dall'endpoint, non da un fallback hardcoded. */
+  initialIsLive?: boolean;
+  /** "console" is the homepage CI-run world; default keeps the incumbent look. */
+  variant?: 'default' | 'console';
+}
 
-export default function StatsBar() {
-  const [stats, setStats] = useState<Stats>(FALLBACK);
-  const [live, setLive] = useState(false);
+// Usato solo se la pagina non passa nulla (nessun chiamante oggi lo fa).
+// Shown only until /api/stats answers. pypi_downloads_month is now genuinely
+// monthly (pypistats /recent), so this value is an order of magnitude lower than
+// the old one, which was a lifetime cumulative mislabelled as monthly.
+const FALLBACK: Stats = { github_stars: 831, pypi_downloads_month: 5690, audits_run: 2006 };
+
+export default function StatsBar({ initial, initialIsLive = false, variant = 'default' }: StatsBarProps) {
+  const [stats, setStats] = useState<Stats>(initial ?? FALLBACK);
+  const [live, setLive] = useState(initialIsLive);
 
   useEffect(() => {
     fetch(buildApiUrl('/stats'))
       .then((r) => r.json())
       .then((data: Stats) => {
-        if (data.github_stars > 0) {
+        // All or nothing, same rule as utils/publicStats.ts: the endpoint returns 0
+        // for any counter it could not fetch, and a 0 on screen reads as "nobody uses
+        // this" — worse than the build-time value from a few hours earlier.
+        if (data.github_stars > 0 && data.pypi_downloads_month > 0 && data.audits_run > 0) {
           setStats(data);
           setLive(true);
         }
       })
       .catch(() => {});
   }, []);
+
+  if (variant === 'console') {
+    const rows: Array<[string, string]> = [
+      [fmt(stats.github_stars), 'GitHub stars'],
+      [fmt(stats.pypi_downloads_month), 'downloads/mo'],
+      [fmt(stats.audits_run), 'audits run'],
+    ];
+    return (
+      <div>
+        <dl className="mt-8 flex flex-wrap items-stretch gap-y-2 divide-x divide-rail">
+          {rows.map(([value, label]) => (
+            <div key={label} className="flex items-baseline gap-2 pr-5 pl-5 first:pl-0">
+              <dd className="font-mono text-base font-semibold tabular-nums text-ink">{value}</dd>
+              <dt className="text-[13px] text-ink-mute">{label}</dt>
+            </div>
+          ))}
+        </dl>
+        <p className="mt-2 font-text font-medium text-[12.5px] text-ink-mute">
+          {live ? (
+            <>
+              <span aria-hidden="true" className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-pass align-middle" />
+              live · GET /api/stats
+            </>
+          ) : (
+            'snapshot: counters could not be refreshed'
+          )}
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -60,7 +108,7 @@ export default function StatsBar() {
         </div>
       </div>
       {!live && (
-        <p className="mt-2 text-xs text-text-muted font-mono">Snapshot: as of July 2026 — not live data</p>
+        <p className="mt-2 text-xs text-text-muted font-mono">Snapshot: counters could not be refreshed</p>
       )}
     </div>
   );

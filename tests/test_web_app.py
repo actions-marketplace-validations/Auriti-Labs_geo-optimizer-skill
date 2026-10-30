@@ -352,6 +352,16 @@ def test_security_headers_presenti(client):
     assert "https://cdn.sanity.io" in response.headers["content-security-policy"]
 
 
+def test_csp_allows_clarity_in_script_connect_and_img(client):
+    """Microsoft Clarity (loaded after consent) must not be blocked by the CSP."""
+    csp = client.get("/health").headers["content-security-policy"]
+    directives = {d.split()[0]: d for d in csp.split("; ") if d}
+    assert "https://*.clarity.ms" in directives["script-src"]
+    assert "https://*.clarity.ms" in directives["connect-src"]
+    assert "https://c.bing.com" in directives["connect-src"]
+    assert "https://c.bing.com" in directives["img-src"]
+
+
 # ─── Test: _audit_result_to_dict ────────────────────────────────────────────
 
 
@@ -458,6 +468,20 @@ def test_badge_happy_path_restituisce_svg(client):
     assert b"<svg" in response.content
 
 
+def test_api_audit_timeout_points_to_the_cli(client):
+    """POST /api/audit that times out answers 504 and says the CLI has no 60 s cap."""
+    import asyncio
+
+    with (
+        patch("geo_optimizer.utils.validators.validate_public_url", return_value=(True, "")),
+        patch("geo_optimizer.core.audit.run_full_audit", side_effect=asyncio.TimeoutError()),
+    ):
+        response = client.post("/api/audit", json={"url": "https://timeout-example.test"})
+
+    assert response.status_code == 504
+    assert "geo audit --url" in response.json()["detail"]
+
+
 def test_badge_audit_timeout_restituisce_badge_errore(client):
     """GET /badge con audit in timeout restituisce badge SVG di errore."""
     import asyncio
@@ -490,6 +514,35 @@ def test_badge_audit_eccezione_generica_restituisce_badge_errore(client):
 def test_badge_url_privato_ritorna_400(client):
     """GET /badge con URL interno ritorna 400 (anti-SSRF)."""
     response = client.get("/badge?url=http://10.0.0.1")
+    assert response.status_code == 400
+
+
+def test_badge_url_con_coda_markdown_ritorna_400(client):
+    """GET /badge con snippet Markdown incollato male ritorna 400, non 500.
+
+    urlparse solleva ValueError("Invalid IPv6 URL") sulle parentesi quadre.
+    """
+    response = client.get("/badge?url=https://site.com)](https://geoready.dev?utm_source=badge")
+    assert response.status_code == 400
+
+
+def test_audit_timeout_is_below_the_proxy_timeout():
+    """The web audit must give up before nginx's 60 s proxy_read_timeout.
+
+    At exactly 60 s nginx always answered first with its HTML 504, so the friendly
+    JSON error and the "Error" badge never reached the client.
+    """
+    from geo_optimizer.web.app import _AUDIT_TIMEOUT_S
+
+    assert _AUDIT_TIMEOUT_S < 60
+
+
+def test_badge_url_con_coda_markdown_ritorna_400(client):
+    """GET /badge con snippet Markdown incollato male ritorna 400, non 500.
+
+    urlparse solleva ValueError("Invalid IPv6 URL") sulle parentesi quadre.
+    """
+    response = client.get("/badge?url=https://site.com)](https://geoready.dev?utm_source=badge")
     assert response.status_code == 400
 
 
@@ -547,6 +600,8 @@ def test_report_id_valido_con_report_in_cache_ritorna_html(client):
 
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
+    # robots.txt blocca la scansione, non l'indicizzazione di un URL linkato altrove
+    assert response.headers["x-robots-tag"] == "noindex, nofollow"
 
 
 # ─── Test: _verify_bearer_token ───────────────────────────────────────────────
@@ -711,18 +766,23 @@ def test_ai_faq_json_punteggi_coerenti_con_config(client):
 
     risposta = score_faq["answer"]
 
-    # Verifica categorie e punteggi corretti (da config.SCORING)
-    assert "8 categories" in risposta, f"Deve citare 8 categorie, trovato: {risposta}"
-    assert "schema (16pt)" in risposta, f"Schema deve essere 16pt, trovato: {risposta}"
-    assert "content (12pt)" in risposta, f"Content deve essere 12pt, trovato: {risposta}"
-    assert "signals (6pt)" in risposta, f"Signals deve essere 6pt, trovato: {risposta}"
-    assert "brand" in risposta.lower(), f"Deve includere la categoria brand, trovato: {risposta}"
+    # Categorie e massimi devono coincidere con la rubric di default (CATEGORY_MAX_V2)
+    from geo_optimizer.models.config import CATEGORY_MAX_V2
 
-    # Verifica che i vecchi valori errati non siano presenti
-    assert "7 categories" not in risposta, f"Non deve citare 7 categorie: {risposta}"
-    assert "schema (22pt)" not in risposta, f"schema=22pt è il valore errato: {risposta}"
-    assert "content (14pt)" not in risposta, f"content=14pt è il valore errato: {risposta}"
-    assert "signals (8pt)" not in risposta, f"signals=8pt è il valore errato: {risposta}"
+    assert f"{len(CATEGORY_MAX_V2)} rubric v2 categories" in risposta, risposta
+    labels = {
+        "google_ai": "Google AI readiness",
+        "robots": "robots.txt",
+        "schema": "schema",
+        "content": "content",
+        "brand_entity": "brand & entity",
+        "meta": "meta",
+        "llms": "llms.txt",
+        "signals": "signals",
+        "ai_discovery": "AI discovery",
+    }
+    for key, max_points in CATEGORY_MAX_V2.items():
+        assert f"{labels[key]} ({max_points}pt)" in risposta, f"{key} deve valere {max_points}pt: {risposta}"
 
 
 def test_ai_summary_json_restituisce_struttura_valida(client):
@@ -746,3 +806,66 @@ def test_ai_service_json_restituisce_capabilities(client):
     assert "name" in data
     assert "capabilities" in data
     assert len(data["capabilities"]) > 0
+
+
+# ─── Test: redirect 301 SEO ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "/de/beste-geo-tools",
+        "/de/beste-geo-tools/",
+        "/nl/beste-geo-tools",
+        "/nl/beste-geo-tools/",
+    ],
+)
+def test_pagine_comparison_ritirate_ridirigono_301_su_best_geo_tools(client, source):
+    """Le pagine DE/NL ritirate devono rispondere 301 verso /best-geo-tools/.
+
+    Erano servite in produzione (impression e ranking in GSC) e sono cadute nel
+    passaggio di branch: senza il 301 risponderebbero 404 e l'equity va persa.
+    """
+    response = client.get(source, follow_redirects=False)
+
+    assert response.status_code == 301, f"{source} deve rispondere 301, non {response.status_code}"
+    assert response.headers["location"] == "/best-geo-tools/"
+
+
+def test_redirect_seo_non_intercetta_altri_path(client):
+    """Un path fuori dalla mappa redirect non deve ricevere un 301 dalla mappa.
+
+    /best-geo-tools/ (la destinazione) e un path inesistente qualunque devono
+    passare a StaticFiles: la mappa non deve fare da catch-all.
+    """
+    response = client.get("/de/qualcosa-altro", follow_redirects=False)
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        ("/state-of-geo-2026", "/state-of-geo/june-2026/"),
+        ("/state-of-geo-2026/", "/state-of-geo/june-2026/"),
+        ("/guides/2", "/guides/"),
+        ("/guides/2/", "/guides/"),
+        ("/guides/10", "/guides/"),
+        ("/guides/10/", "/guides/"),
+        ("/docs/index", "/docs/"),
+        ("/docs/index/", "/docs/"),
+    ],
+)
+def test_redirect_301_seo_paginazione_e_state_of_geo(client, source, target):
+    """Il vecchio slug State of GEO e la paginazione /guides/ rimossa devono dare 301 (non meta-refresh/soft-404).
+
+    /state-of-geo-2026 era un redirect client-side (<meta refresh>) che i motori
+    trattano come soft-404; /guides/2..10 sono doorway sottili rimosse. Entrambi
+    consolidano con una vera 301 verso la pagina corretta.
+    """
+    for method in (client.get, client.head):
+        response = method(source, follow_redirects=False)
+
+        assert response.status_code == 301, (
+            f"{method.__name__.upper()} {source} deve rispondere 301, non {response.status_code}"
+        )
+        assert response.headers["location"] == target

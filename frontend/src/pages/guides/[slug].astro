@@ -25,7 +25,11 @@ if (!article) return Astro.redirect('/404', 301);
 
 const canonical = `https://geoready.dev/guides/${slug}/`;
 const title = article.metaTitle || article.title;
-const schemaType = article.schemaOrgType || 'Article';
+// HowTo è deprecato per Google (set 2023) e qui sostituirebbe l'entità Article
+// principale con proprietà che HowTo nemmeno prevede (headline, ecc.). Se il CMS
+// lo indica ancora su vecchi articoli, degrada ad Article; la bonifica del campo
+// schemaOrgType va fatta in Sanity Studio.
+const schemaType = article.schemaOrgType === 'HowTo' ? 'Article' : article.schemaOrgType || 'Article';
 const author = article.author || 'Juan Camilo Auriti';
 const ogImageUrl = article.ogImage?.asset
   ? urlForImage(article.ogImage).width(1200).height(630).fit('crop').auto('format').url()
@@ -202,13 +206,11 @@ const jsonLd = {
         : {}),
       datePublished: article.datePublished,
       dateModified: article.dateModified,
-      author: { '@type': 'Person', name: author, url: 'https://geoready.dev/about/' },
-      publisher: {
-        '@type': 'Organization',
-        name: 'GeoReady',
-        url: 'https://geoready.dev',
-        logo: { '@type': 'ImageObject', url: 'https://geoready.dev/icon-512.png' },
-      },
+      // Founder and Organization are defined once in the global graph (Layout.astro)
+      author: author === 'Juan Camilo Auriti'
+        ? { '@id': 'https://geoready.dev/#founder' }
+        : { '@type': 'Person', name: author, url: 'https://geoready.dev/about/' },
+      publisher: { '@id': 'https://geoready.dev/#organization' },
       mainEntityOfPage: canonical,
       isPartOf: { '@id': 'https://geoready.dev/#website' },
     },
@@ -245,32 +247,36 @@ const jsonLd = {
   <article class="max-w-7xl mx-auto px-4 sm:px-6 py-10 md:py-16" itemscope itemtype="https://schema.org/Article">
     {/* ── Header ──────────────────────────────────────────────────────────── */}
     <header class="mb-12 md:mb-16 max-w-3xl">
-      <div class="flex items-center gap-2 text-[10px] font-mono text-text-muted uppercase tracking-wider">
-        <a href="/guides/" class="hover:text-accent-teal">Guides</a>
-        <span class="w-1 h-1 rounded-full bg-text-muted" />
-        {article.focusKeyword && <span>{article.focusKeyword}</span>}
-      </div>
+      <nav aria-label="Breadcrumb" class="eyebrow flex items-center gap-2">
+        <a href="/guides/" class="underline decoration-rail underline-offset-4 transition-colors hover:text-ink hover:decoration-pass-deep">Guides</a>
+        {article.focusKeyword && (
+          <>
+            <span aria-hidden="true">/</span>
+            <span>{article.focusKeyword}</span>
+          </>
+        )}
+      </nav>
 
-      <h1 itemprop="headline" class="mt-3 font-display text-3xl md:text-4xl font-bold text-text-primary leading-tight tracking-tight">
+      <h1 itemprop="headline" class="mt-4 text-[2.1rem] leading-[1.08] tracking-[-0.03em] text-ink sm:text-[2.6rem]">
         {article.title}
       </h1>
 
-      <p class="mt-4 text-base md:text-lg text-text-secondary leading-relaxed">
+      <p class="mt-4 text-base leading-relaxed text-ink-soft md:text-lg">
         {article.description}
       </p>
 
-      <div class="mt-5 flex items-center gap-3 text-xs font-mono text-text-muted">
+      <div class="eyebrow mt-5 flex flex-wrap items-center gap-x-3 gap-y-1">
         <span itemprop="author">{author}</span>
-        <span>·</span>
-        <time itemprop="datePublished" datetime={article.datePublished}>
+        <span class="hidden sm:inline" aria-hidden="true">·</span>
+        <span>published: <time itemprop="datePublished" datetime={article.datePublished}>
           {new Date(article.datePublished).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
-        </time>
+        </time></span>
         {article.dateModified !== article.datePublished && (
           <>
-            <span>· Updated</span>
-            <time itemprop="dateModified" datetime={article.dateModified}>
+            <span class="hidden sm:inline" aria-hidden="true">·</span>
+            <span>updated: <time itemprop="dateModified" datetime={article.dateModified}>
               {new Date(article.dateModified).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
-            </time>
+            </time></span>
           </>
         )}
       </div>
@@ -286,39 +292,41 @@ const jsonLd = {
     )}
 
     {/* ── Body ─────────────────────────────────────────────────────────────── */}
-    <div class="pt-prose">
+    <div class="pt-prose max-w-3xl">
       <PortableText value={article.body} components={ptComponents} />
     </div>
 
-    <section class="mt-12 max-w-3xl rounded-[--radius-lg] border border-accent-teal/25 bg-accent-teal/5 p-5 md:p-6" aria-labelledby="guide-next-step-heading">
-      <p class="font-mono text-[11px] uppercase tracking-[0.18em] text-accent-teal">{commercialLinkBlock.eyebrow}</p>
-      <h2 id="guide-next-step-heading" class="mt-2 font-display text-2xl font-bold leading-tight tracking-tight text-text-primary">
-        {commercialLinkBlock.heading}
-      </h2>
-      <p class="mt-3 text-sm md:text-base leading-relaxed text-text-secondary">
-        {commercialLinkBlock.copy}
-      </p>
-      <div class="mt-5 flex flex-col gap-3 sm:flex-row">
-        <a
-          href={commercialLinkBlock.primary.href}
-          data-cta={`${commercialLinkBlock.primary.dataCta}_${slug}`}
-          class="inline-flex items-center justify-center rounded-[--radius-lg] bg-accent-teal px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-accent-teal-dark"
-        >
-          {commercialLinkBlock.primary.label}
-        </a>
-        <a
-          href={commercialLinkBlock.secondary.href}
-          data-cta={`${commercialLinkBlock.secondary.dataCta}_${slug}`}
-          class="inline-flex items-center justify-center rounded-[--radius-lg] border border-border bg-bg-base px-4 py-3 text-sm font-semibold text-text-primary transition-colors hover:border-accent-teal/40 hover:text-accent-teal"
-        >
-          {commercialLinkBlock.secondary.label}
-        </a>
+    <section class="band-dark mt-12 max-w-3xl rounded-[14px]" aria-labelledby="guide-next-step-heading" data-reveal>
+      <div class="p-6 md:p-8">
+        <div class="eyebrow">{commercialLinkBlock.eyebrow}</div>
+        <h2 id="guide-next-step-heading" class="mt-3 text-2xl leading-tight tracking-[-0.03em] text-ink md:text-[2rem]">
+          {commercialLinkBlock.heading}
+        </h2>
+        <p class="mt-3 text-sm leading-relaxed text-ink-soft md:text-base">
+          {commercialLinkBlock.copy}
+        </p>
+        <div class="mt-5 flex flex-col gap-3 sm:flex-row">
+          <a
+            href={commercialLinkBlock.primary.href}
+            data-cta={`${commercialLinkBlock.primary.dataCta}_${slug}`}
+            class="inline-flex min-h-11 items-center justify-center rounded-[9px] bg-accent px-6 py-3 text-[14px] font-semibold text-on-accent transition-colors hover:bg-pass"
+          >
+            {commercialLinkBlock.primary.label}
+          </a>
+          <a
+            href={commercialLinkBlock.secondary.href}
+            data-cta={`${commercialLinkBlock.secondary.dataCta}_${slug}`}
+            class="inline-flex min-h-11 items-center justify-center rounded-[9px] px-6 py-3 text-[14px] font-semibold text-ink shadow-[inset_0_0_0_1px_#2A3838] transition-shadow hover:shadow-[inset_0_0_0_1px_#2DD4BF]"
+          >
+            {commercialLinkBlock.secondary.label}
+          </a>
+        </div>
+        <ul class="mt-5 grid gap-2 text-sm leading-relaxed text-ink-soft md:grid-cols-2">
+          {commercialLinkBlock.proofPoints.map((point) => (
+            <li class="border-l border-rail pl-3">{point}</li>
+          ))}
+        </ul>
       </div>
-      <ul class="mt-5 grid gap-2 text-sm leading-relaxed text-text-secondary md:grid-cols-2">
-        {commercialLinkBlock.proofPoints.map((point) => (
-          <li class="border-l border-accent-teal/30 pl-3">{point}</li>
-        ))}
-      </ul>
     </section>
 
     {supplementalVisuals.length > 0 && (
@@ -336,15 +344,15 @@ const jsonLd = {
 
     {/* ── FAQs ─────────────────────────────────────────────────────────────── */}
     {article.faqs && article.faqs.length > 0 && (
-      <section class="mt-16">
-        <h2 class="font-display text-2xl font-bold text-text-primary leading-tight tracking-tight mb-6">
+      <section class="mt-16 max-w-3xl" data-reveal>
+        <h2 class="mb-6 font-head text-2xl leading-tight tracking-[-0.02em] text-ink">
           Frequently asked questions
         </h2>
-        <div class="space-y-7">
+        <div class="panel divide-y divide-rail overflow-hidden">
           {article.faqs.map((faq: any) => (
-            <div>
-              <h3 class="font-display text-lg font-semibold text-text-primary">{faq.question}</h3>
-              <p class="mt-2 text-text-secondary leading-relaxed">{faq.answer}</p>
+            <div class="p-6">
+              <h3 class="text-base font-semibold text-ink">{faq.question}</h3>
+              <p class="mt-2 leading-relaxed text-ink-soft">{faq.answer}</p>
             </div>
           ))}
         </div>
@@ -367,19 +375,21 @@ const jsonLd = {
 </Shell>
 
 <style is:global>
-  .pt-prose h2 { font-family: var(--font-display, inherit); font-size: 1.5rem; font-weight: 700; color: var(--color-text-primary, inherit); line-height: 1.25; letter-spacing: -0.025em; margin-top: 3rem; margin-bottom: 1rem; }
-  .pt-prose h3 { font-family: var(--font-display, inherit); font-size: 1.125rem; font-weight: 600; color: var(--color-text-primary, inherit); margin-top: 2rem; margin-bottom: 0.75rem; }
-  .pt-prose h4 { font-weight: 600; color: var(--color-text-primary, inherit); margin-top: 1.5rem; margin-bottom: 0.5rem; }
-  .pt-prose p { color: var(--color-text-secondary, inherit); line-height: 1.75; margin-top: 1rem; }
+  /* pesi titoli dalla base v3 (h2 Headline 520, h3 Text 600); fondi codice dai token tema, non #FFF fisso (illeggibile in dark) */
+  .pt-prose h2 { font-family: var(--font-head, inherit); font-size: 1.5rem; color: var(--color-ink, inherit); line-height: 1.25; letter-spacing: -0.02em; margin-top: 3rem; margin-bottom: 1rem; }
+  .pt-prose h3 { font-size: 1.125rem; color: var(--color-ink, inherit); margin-top: 2rem; margin-bottom: 0.75rem; }
+  .pt-prose h4 { font-weight: 600; color: var(--color-ink, inherit); margin-top: 1.5rem; margin-bottom: 0.5rem; }
+  .pt-prose p { color: var(--color-ink-soft, inherit); line-height: 1.75; margin-top: 1rem; }
   .pt-prose ul { list-style-type: disc; padding-left: 1.25rem; margin-top: 1rem; }
   .pt-prose ol { list-style-type: decimal; padding-left: 1.25rem; margin-top: 1rem; }
-  .pt-prose li { color: var(--color-text-secondary, inherit); line-height: 1.75; margin-top: 0.375rem; }
-  .pt-prose strong { font-weight: 600; color: var(--color-text-primary, inherit); }
+  .pt-prose li { color: var(--color-ink-soft, inherit); line-height: 1.75; margin-top: 0.375rem; }
+  .pt-prose li::marker { color: var(--color-ink-mute, inherit); }
+  .pt-prose strong { font-weight: 600; color: var(--color-ink, inherit); }
   .pt-prose em { font-style: italic; }
-  .pt-prose code { font-size: 0.875rem; font-family: ui-monospace, monospace; background: var(--color-bg-surface, #1a1a1a); border: 1px solid var(--color-border, #333); border-radius: 0.25rem; padding: 0.125rem 0.25rem; }
-  .pt-prose pre { background: var(--color-bg-surface, #1a1a1a); border: 1px solid var(--color-border, #333); border-radius: 0.75rem; padding: 1rem; margin: 1.5rem 0; overflow-x: auto; font-size: 0.875rem; font-family: ui-monospace, monospace; }
-  .pt-prose pre code { background: none; border: none; padding: 0; }
-  .pt-prose a { color: var(--color-accent-teal, #2dd4bf); }
-  .pt-prose a:hover { text-decoration: underline; }
-  .pt-prose blockquote { border-left: 4px solid var(--color-accent-teal, #2dd4bf); padding-left: 1rem; font-style: italic; color: var(--color-text-secondary, inherit); margin: 1.5rem 0; }
+  .pt-prose code { font-size: 0.875rem; font-family: var(--font-mono, ui-monospace, monospace); color: var(--color-ink, inherit); overflow-wrap: anywhere; background: var(--color-raised, #FFFFFF); border: 1px solid var(--color-rail, #DFE5E5); border-radius: 2px; padding: 0.125rem 0.25rem; }
+  .pt-prose pre { color: var(--color-ink, inherit); background: var(--color-raised, #FFFFFF); border: 1px solid var(--color-rail, #DFE5E5); border-radius: 4px; padding: 1rem; margin: 1.5rem 0; overflow-x: auto; font-size: 0.875rem; font-family: var(--font-mono, ui-monospace, monospace); }
+  .pt-prose pre code { background: none; border: none; padding: 0; overflow-wrap: normal; }
+  .pt-prose a { color: var(--color-pass-deep, inherit); text-decoration-line: underline; text-decoration-color: var(--color-rail, #DFE5E5); text-underline-offset: 4px; }
+  .pt-prose a:hover { text-decoration-color: var(--color-pass-deep, currentColor); }
+  .pt-prose blockquote { border-left: 1px solid var(--color-pass, #0B8076); padding-left: 1rem; font-style: italic; color: var(--color-ink-soft, inherit); margin: 1.5rem 0; }
 </style>

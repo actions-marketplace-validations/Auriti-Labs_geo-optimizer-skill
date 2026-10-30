@@ -57,10 +57,10 @@ These four bots directly determine whether AI search engines cite your site. **N
 
 | Bot | Type | Purpose | Crawl Frequency |
 |-----|------|---------|----------------|
-| `Google-Extended` | Training + AI Overviews | Gemini training and Google AI Overviews | Frequent |
+| `Google-Extended` | Training only | Gemini Apps and Vertex AI generative model training/grounding | Frequent |
 | `Googlebot` | Search + Citation | Traditional Google Search and AI-assisted results | Very frequent |
 
-Note: `Google-Extended` is a `robots.txt` token, not a separate user-agent. Blocking it removes your site from Google AI Overviews.
+Note: `Google-Extended` is a `robots.txt` token, not a separate user-agent. It does not affect Google Search or Google AI Overviews: it only controls use of content for Gemini/Vertex AI training and grounding. Googlebot is what matters for AI Overviews.
 
 ### Microsoft (Copilot)
 
@@ -273,5 +273,5 @@ For managed hosting without log access, check **Google Search Console → Settin
 
 - OpenAI bot docs: [openai.com/gptbot](https://openai.com/gptbot)
 - Anthropic bot docs: [anthropic.com/legal/aup](https://www.anthropic.com/legal/aup)
-- Perplexity bot docs: [docs.perplexity.ai/guides/perplexity-bot](https://docs.perplexity.ai/guides/perplexity-bot)
+- Perplexity bot docs: [docs.perplexity.ai/docs/resources/perplexity-crawlers](https://docs.perplexity.ai/docs/resources/perplexity-crawlers)
 - Google crawlers: [developers.google.com/search/docs/crawling-indexing/google-common-crawlers](https://developers.google.com/search/docs/crawling-indexing/google-common-crawlers)

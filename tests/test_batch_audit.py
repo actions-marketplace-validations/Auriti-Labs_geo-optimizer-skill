@@ -25,6 +25,11 @@ def _make_audit_result(url: str, score: int, band: str, breakdown: dict[str, int
 class TestBatchAudit:
     """Test per `run_batch_audit_async` e aggregazione risultati."""
 
+    # _async_runtime_available() probes for httpx. Pinned to True so the test
+    # exercises the async branch it mocks: without this, an environment lacking
+    # httpx falls through to to_thread(run_full_audit, ...) — unmocked — and the
+    # audit hits the network instead of the fixtures.
+    @patch("geo_optimizer.core.batch_audit._async_runtime_available", return_value=True)
     @patch("geo_optimizer.core.batch_audit.asyncio.to_thread", new_callable=AsyncMock)
     @patch("geo_optimizer.core.batch_audit.fetch_sitemap")
     @patch("geo_optimizer.core.batch_audit.run_full_audit_async")
@@ -33,6 +38,7 @@ class TestBatchAudit:
         mock_run_full_audit_async,
         mock_fetch_sitemap,
         mock_to_thread,
+        mock_async_available,
     ):
         """La sitemap viene auditata e aggregata in un risultato batch coerente."""
         mock_to_thread.side_effect = lambda func, *args, **kwargs: func(*args, **kwargs)
@@ -112,3 +118,57 @@ class TestBatchAudit:
             use_cache=True,
             project_config=None,
         )
+
+
+def test_batch_url_slower_than_perf_budget_still_succeeds():
+    """#556: the 10s perf budget only warns; a slow but healthy page must not time out."""
+    from geo_optimizer.core.batch_audit import _audit_urls
+    from geo_optimizer.models.config import DEFAULT_SCORE_VERSION
+    from geo_optimizer.models.results import BatchAuditPageResult
+
+    async def _slow(url, **kwargs):
+        await asyncio.sleep(0.05)
+        return BatchAuditPageResult(url=url, score=80, band="good", http_status=200)
+
+    with (
+        patch("geo_optimizer.core.batch_audit._audit_single_url", side_effect=_slow),
+        # pre-#556 the batch deadline *was* this budget: shrinking it must not fail the URL
+        patch("geo_optimizer.core.batch_audit.AUDIT_TIMEOUT_SECONDS", 0.01, create=True),
+    ):
+        pages = asyncio.run(
+            _audit_urls(
+                ["https://e.com/a"],
+                use_cache=False,
+                project_config=None,
+                score_version=DEFAULT_SCORE_VERSION,
+                concurrency=1,
+            )
+        )
+
+    assert pages[0].error is None
+    assert pages[0].score == 80
+
+
+def test_batch_url_hung_audit_times_out():
+    """A genuinely hung audit is still cut at BATCH_URL_TIMEOUT_SECONDS."""
+    from geo_optimizer.core.batch_audit import _audit_urls
+    from geo_optimizer.models.config import DEFAULT_SCORE_VERSION
+
+    async def _hang(url, **kwargs):
+        await asyncio.sleep(10)
+
+    with (
+        patch("geo_optimizer.core.batch_audit._audit_single_url", side_effect=_hang),
+        patch("geo_optimizer.core.batch_audit.BATCH_URL_TIMEOUT_SECONDS", 0.05),
+    ):
+        pages = asyncio.run(
+            _audit_urls(
+                ["https://e.com/a"],
+                use_cache=False,
+                project_config=None,
+                score_version=DEFAULT_SCORE_VERSION,
+                concurrency=1,
+            )
+        )
+
+    assert pages[0].error == "Timeout (0.05s)"

@@ -10,16 +10,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from urllib.parse import urljoin
 
 # ─── Re-exports from split modules (backward compatibility, #402) ────────────
 from geo_optimizer.core.audit_ai_discovery import (
     _audit_ai_discovery_from_responses,
     audit_ai_discovery,  # noqa: F401
+    check_markdown_negotiation,
+    check_markdown_negotiation_async,
 )
 from geo_optimizer.core.audit_brand import audit_brand_entity  # noqa: F401
 from geo_optimizer.core.audit_cdn import audit_cdn_ai_crawler  # noqa: F401
 from geo_optimizer.core.audit_content import audit_content_quality  # noqa: F401
+from geo_optimizer.core.audit_google_ai import run_google_ai_checks
 from geo_optimizer.core.audit_js import audit_js_rendering  # noqa: F401
 from geo_optimizer.core.audit_llms import (
     _audit_llms_from_response,
@@ -44,11 +48,16 @@ from geo_optimizer.core.scoring import (  # noqa: F401 (re-exported for backward
 from geo_optimizer.models.config import (  # noqa: F401 (VALUABLE_SCHEMAS re-exported)
     ABOUT_LINK_PATTERNS,
     AI_BOTS,
+    AUDIT_STEPS,
     AUDIT_TIMEOUT_SECONDS,
     CATEGORY_MAX,
+    CATEGORY_MAX_BY_VERSION,
     CITATION_BOTS,
     CONTENT_MIN_WORDS,
+    DEFAULT_SCORE_VERSION,
     KEYWORD_STUFFING_THRESHOLD,
+    RECOMMENDATION_BLOCKERS_CATEGORY,
+    RECOMMENDATION_OTHER_CATEGORY,
     ROBOTS_KEY_BOTS_DISPLAY,
     SCORE_BANDS,
     SCORING,
@@ -62,6 +71,7 @@ from geo_optimizer.models.results import (
     CdnAiCrawlerResult,
     CitabilityResult,
     ContentResult,
+    GoogleAiReadinessResult,
     JsRenderingResult,
     LlmsTxtResult,
     MetaResult,
@@ -76,8 +86,12 @@ from geo_optimizer.models.results import (
 from geo_optimizer.utils.http import fetch_url
 from geo_optimizer.utils.validators import normalize_url_scheme
 
+# Shared by build_recommendations / build_categorized_recommendations: one (category, text) pair per
+# recommendation, in final output order.
+CategorizedRecommendation = tuple[str, str]
 
-def build_recommendations(
+
+def build_categorized_recommendations(
     base_url: str,
     robots: RobotsResult,
     llms: LlmsTxtResult,
@@ -92,21 +106,43 @@ def build_recommendations(
     prompt_injection: PromptInjectionResult | None = None,
     score_breakdown: dict[str, int] | None = None,
     multimodal: MultimodalResult | None = None,
-) -> list[str]:
-    """Build a prioritized list of recommendations sorted by score impact (gap #5).
+    google_ai: GoogleAiReadinessResult | None = None,
+    category_max: dict | None = None,
+) -> list[CategorizedRecommendation]:
+    """Build the prioritized recommendations as ``(category, text)`` pairs (gap #5).
 
-    Priority buckets (returned in order):
-      critical → HIGH (robots 18pt, llms 18pt, meta 14pt)
-      → MEDIUM (brand 10pt, schema 13pt, content 12pt, negative penalty)
-      → LOW (signals 6pt, ai_discovery 6pt, webmcp, product)
+    This is the single source of truth: ``build_recommendations`` returns the texts of this
+    list and ``group_recommendations_by_category`` groups it, so the flat list and the
+    per-category view can never diverge.
+
+    ``category`` is the ``score_breakdown`` key of the category that produced the
+    recommendation (``robots``, ``llms``, ``schema``, ``meta``, ``content``, ``brand_entity``,
+    ``signals``, ``ai_discovery``, ``google_ai``), or one of two non-scored keys for
+    recommendations with no scored category:
+
+    - ``meta``: the two critical page-level blocks (X-Robots-Tag noindex, ``noai``), because
+      ``MetaResult`` detects them and rubric v1 scores the noindex penalty under meta;
+    - ``blockers`` (``RECOMMENDATION_BLOCKERS_CATEGORY``): the critical prompt-injection items
+      and the critical UGC injection risk produced here; ``_build_audit_result`` adds the CDN/WAF
+      block and the JavaScript-rendering warning to the same key;
+    - ``other`` (``RECOMMENDATION_OTHER_CATEGORY``): the non-critical UGC advisory, negative
+      signals, WebMCP and multimodal readiness.
+
+    Priority buckets are returned in critical, high, medium, and low order.
+    Category maxima come from the selected score version and include
+    ``google_ai`` when that category is part of the rubric.
 
     When ``score_breakdown`` (from ``compute_score_breakdown``) is provided,
     categories inside each bucket are reordered by recoverable points
     (category max minus points earned), so the highest-impact fixes come first.
-    Without it, the static category order above is kept.
+    Without it, the static category order of each bucket is kept.
     """
-    _critical: list[str] = []
+    # Critical bucket is not reordered, so it is kept as two ordered segments: meta-owned blocks first,
+    # then the crawler blockers (same relative order as the pre-categorisation implementation).
+    _c_meta: list[str] = []
+    _c_blockers: list[str] = []
     _h_robots: list[str] = []
+    _h_google_ai: list[str] = []
     _h_llms: list[str] = []
     _h_meta: list[str] = []
     _m_llms: list[str] = []
@@ -117,21 +153,27 @@ def build_recommendations(
     _m_negative: list[str] = []
     _l_signals: list[str] = []
     _l_content: list[str] = []
+    _l_ugc: list[str] = []  # UGC advisory: sorted with content, but not a content-scored recommendation
     _l_ai: list[str] = []
     _l_schema: list[str] = []
     _l_webmcp: list[str] = []
     _l_multimodal: list[str] = []
 
+    if google_ai is not None and google_ai.checked:
+        for check in google_ai.checks:
+            if check.status in ("fail", "warn") and check.max_points:
+                _h_google_ai.append(f"[{check.id}] {check.evidence} — {check.source_url}")
+
     # ── CRITICAL — blocking signals ─────────────────────────────────────────
     # gap #2: X-Robots-Tag: noindex via HTTP header
     if getattr(meta, "x_robots_noindex", False):
-        _critical.append(
+        _c_meta.append(
             f"CRITICAL: X-Robots-Tag: {meta.x_robots_tag} detected in HTTP response headers — "
             "AI crawlers will skip this page entirely. Remove the header or set it to 'all'."
         )
     # gap #7: noai in meta robots
     if getattr(meta, "has_noai", False):
-        _critical.append(
+        _c_meta.append(
             f"noai directive detected in meta robots ({meta.noai_value}) — "
             "some AI search engines respect this and may refuse to cite your content. "
             "Remove 'noai' to maximize AI citability."
@@ -139,16 +181,31 @@ def build_recommendations(
     # v4.4: Prompt Injection — critical manipulation patterns
     if prompt_injection is not None and prompt_injection.checked and prompt_injection.severity != "clean":
         if prompt_injection.llm_instruction_found:
-            _critical.append(
+            _c_blockers.append(
                 "⚠️ CRITICAL: LLM prompt instructions detected in page content — "
                 "this is a manipulation pattern that AI engines actively penalize"
             )
         if prompt_injection.html_comment_injection_found:
-            _critical.append("⚠️ Prompt injection in HTML comments detected — AI crawlers read comments, remove them")
+            _c_blockers.append("⚠️ Prompt injection in HTML comments detected — AI crawlers read comments, remove them")
         if prompt_injection.hidden_text_found:
-            _critical.append(
+            _c_blockers.append(
                 "Hidden text detected (display:none/visibility:hidden with content) — "
                 "AI crawlers can read it and may penalize this cloaking pattern"
+            )
+
+    # UGC injection surface — advisory, runs regardless of severity
+    if prompt_injection is not None and prompt_injection.checked and prompt_injection.ugc_surface_found:
+        _surfaces = ", ".join(prompt_injection.ugc_surface_samples[:3])
+        if prompt_injection.ugc_injection_risk:
+            _c_blockers.append(
+                f"Injection pattern found on a page that also exposes user-generated content ({_surfaces}) — "
+                "the payload may be a third-party comment/review, not your own markup. Moderate the UGC area, "
+                'mark links inside it rel="ugc", and consider excluding unmoderated UGC from AI crawlers.'
+            )
+        else:
+            _l_ugc.append(
+                f"This page exposes user-generated content ({_surfaces}). It is an injection surface — a third "
+                'party can place text there that AI crawlers read. Keep it moderated and mark its links rel="ugc".'
             )
 
     # ── HIGH — robots(18pt), llms(18pt), meta title(5pt) ──────────────────
@@ -280,7 +337,7 @@ def build_recommendations(
 
     # Content details (numbers 1pt, links 1pt)
     if not content.has_numbers:
-        _l_content.append("Add numerical data and concrete statistics (+40% AI visibility)")
+        _l_content.append("Add numerical data and concrete statistics")
     if not content.has_links:
         _l_content.append("Cite authoritative sources with external links (increase AI credibility)")
 
@@ -342,27 +399,39 @@ def build_recommendations(
                 "add one to make it citable by AI engines"
             )
 
-    # gap #5: order categories inside each bucket by recoverable points
-    high_segs: list[tuple[str | None, list[str]]] = [
-        ("robots", _h_robots),
-        ("llms", _h_llms),
-        ("meta", _h_meta),
+    # gap #5: order categories inside each bucket by recoverable points.
+    # Each segment is (sort key, output category, recommendations). The sort key drives the
+    # recoverable-points ordering (None = never reordered, "negative_penalty" = penalty
+    # magnitude); the output category is what ends up in ``recommendations_by_category``.
+    other = RECOMMENDATION_OTHER_CATEGORY
+    critical_segs: list[tuple[str | None, str, list[str]]] = [
+        (None, "meta", _c_meta),
+        (None, RECOMMENDATION_BLOCKERS_CATEGORY, _c_blockers),
     ]
-    medium_segs: list[tuple[str | None, list[str]]] = [
-        ("llms", _m_llms),
-        ("meta", _m_meta),
-        ("brand_entity", _m_brand),
-        ("schema", _m_schema),
-        ("content", _m_content),
-        ("negative_penalty", _m_negative),
+    high_segs: list[tuple[str | None, str, list[str]]] = [
+        ("google_ai", "google_ai", _h_google_ai),
+        ("robots", "robots", _h_robots),
+        ("llms", "llms", _h_llms),
+        ("meta", "meta", _h_meta),
     ]
-    low_segs: list[tuple[str | None, list[str]]] = [
-        ("signals", _l_signals),
-        ("content", _l_content),
-        ("ai_discovery", _l_ai),
-        ("schema", _l_schema),
-        (None, _l_webmcp),
-        (None, _l_multimodal),
+    medium_segs: list[tuple[str | None, str, list[str]]] = [
+        ("llms", "llms", _m_llms),
+        ("meta", "meta", _m_meta),
+        ("brand_entity", "brand_entity", _m_brand),
+        ("schema", "schema", _m_schema),
+        ("content", "content", _m_content),
+        ("negative_penalty", other, _m_negative),
+    ]
+    low_segs: list[tuple[str | None, str, list[str]]] = [
+        ("signals", "signals", _l_signals),
+        # The UGC advisory shares the content sort key (it stays right before the content items)
+        # but is not a content-scored recommendation.
+        ("content", other, _l_ugc),
+        ("content", "content", _l_content),
+        ("ai_discovery", "ai_discovery", _l_ai),
+        ("schema", "schema", _l_schema),
+        (None, other, _l_webmcp),
+        (None, other, _l_multimodal),
     ]
 
     def _recoverable(category: str | None) -> int:
@@ -371,15 +440,77 @@ def build_recommendations(
         if category == "negative_penalty":
             # Penalty is stored as a negative value: recoverable = its magnitude
             return -score_breakdown.get(category, 0)
-        return CATEGORY_MAX.get(category, 0) - max(0, score_breakdown.get(category, 0))
+        effective_category_max = category_max if category_max is not None else CATEGORY_MAX
+        return effective_category_max.get(category, 0) - max(0, score_breakdown.get(category, 0))
 
-    def _flatten(segs: list[tuple[str | None, list[str]]]) -> list[str]:
-        if score_breakdown is not None:
+    def _flatten(
+        segs: list[tuple[str | None, str, list[str]]], reorder: bool = True
+    ) -> list[CategorizedRecommendation]:
+        if reorder and score_breakdown is not None:
             # sorted() is stable: ties keep the static category order
             segs = sorted(segs, key=lambda seg: _recoverable(seg[0]), reverse=True)
-        return [rec for _, seg in segs for rec in seg]
+        return [(category, rec) for _, category, seg in segs for rec in seg]
 
-    return _critical + _flatten(high_segs) + _flatten(medium_segs) + _flatten(low_segs)
+    return _flatten(critical_segs, reorder=False) + _flatten(high_segs) + _flatten(medium_segs) + _flatten(low_segs)
+
+
+def group_recommendations_by_category(items: list[CategorizedRecommendation]) -> dict[str, list[str]]:
+    """Group ``(category, text)`` pairs into ``{category: [text, ...]}``.
+
+    Lists are filled in input order, so within each category the recommendations keep the
+    relative order they have in the flat list. Categories without recommendations are absent.
+    """
+    grouped: dict[str, list[str]] = {}
+    for category, text in items:
+        grouped.setdefault(category, []).append(text)
+    return grouped
+
+
+def build_recommendations(
+    base_url: str,
+    robots: RobotsResult,
+    llms: LlmsTxtResult,
+    schema: SchemaResult,
+    meta: MetaResult,
+    content: ContentResult,
+    ai_discovery: AiDiscoveryResult | None = None,
+    signals: SignalsResult | None = None,
+    brand_entity: BrandEntityResult | None = None,
+    webmcp: WebMcpResult | None = None,
+    negative_signals: NegativeSignalsResult | None = None,
+    prompt_injection: PromptInjectionResult | None = None,
+    score_breakdown: dict[str, int] | None = None,
+    multimodal: MultimodalResult | None = None,
+    google_ai: GoogleAiReadinessResult | None = None,
+    category_max: dict | None = None,
+) -> list[str]:
+    """Build the flat, prioritized list of recommendation texts (backward compatible API).
+
+    Same arguments and same output as before ``recommendations_by_category`` existed. The
+    category of each text is available through ``build_categorized_recommendations``; see
+    that function for the ordering rules.
+    """
+    return [
+        text
+        for _, text in build_categorized_recommendations(
+            base_url=base_url,
+            robots=robots,
+            llms=llms,
+            schema=schema,
+            meta=meta,
+            content=content,
+            ai_discovery=ai_discovery,
+            signals=signals,
+            brand_entity=brand_entity,
+            webmcp=webmcp,
+            negative_signals=negative_signals,
+            prompt_injection=prompt_injection,
+            score_breakdown=score_breakdown,
+            multimodal=multimodal,
+            google_ai=google_ai,
+            category_max=category_max,
+        )
+    ]
 
 
 def _build_audit_result(
@@ -412,6 +543,8 @@ def _build_audit_result(
     instruction_readiness=None,  # v4.9: Instruction Following Readiness (#371)
     intent_mapping=None,  # v4.10: AI Search Intent Mapping (#385)
     hallucination_bait=None,  # v4.10: Hallucination Bait Detection (#377)
+    google_ai=None,  # v4.19: Google AI readiness
+    score_version: int = DEFAULT_SCORE_VERSION,
 ) -> AuditResult:
     """Build AuditResult from sub-audits (fix #97: shared sync/async logic).
 
@@ -554,6 +687,8 @@ def _build_audit_result(
 
         effective_hallucination = HallucinationBaitResult()
 
+    effective_google_ai = google_ai if google_ai is not None else GoogleAiReadinessResult()
+
     # Compute score, breakdown, and band (v4.0: includes signals, ai_discovery, negative_penalty)
     score = compute_geo_score(
         robots,
@@ -565,6 +700,8 @@ def _build_audit_result(
         effective_ai_discovery,
         effective_brand_entity,
         effective_negative_signals,
+        effective_google_ai,
+        score_version,
     )
     breakdown = compute_score_breakdown(
         robots,
@@ -576,11 +713,13 @@ def _build_audit_result(
         effective_ai_discovery,
         effective_brand_entity,
         effective_negative_signals,
+        effective_google_ai,
+        score_version,
     )
     band = get_score_band(score)
 
     # Recommendations
-    recommendations = build_recommendations(
+    categorized = build_categorized_recommendations(
         base_url,
         robots,
         llms,
@@ -595,6 +734,8 @@ def _build_audit_result(
         effective_prompt_injection,
         score_breakdown=breakdown,
         multimodal=effective_multimodal,
+        google_ai=effective_google_ai,
+        category_max=CATEGORY_MAX_BY_VERSION[score_version],
     )
 
     # Fix #460: load entry_point plugins if not already loaded (API + MCP callers)
@@ -630,16 +771,26 @@ def _build_audit_result(
     if effective_cdn.checked and effective_cdn.any_blocked:
         blocked_bots = [b["bot"] for b in effective_cdn.bot_results if b["blocked"] or b["challenge_detected"]]
         cdn_name = effective_cdn.cdn_detected or "CDN/WAF"
-        recommendations.append(
-            f"⚠️ {cdn_name.upper()} blocks AI crawlers: {', '.join(blocked_bots)}. "
-            f"Configure your CDN to allow AI bot User-Agents ({ROBOTS_KEY_BOTS_DISPLAY})."
+        categorized.append(
+            (
+                RECOMMENDATION_BLOCKERS_CATEGORY,
+                f"⚠️ {cdn_name.upper()} blocks AI crawlers: {', '.join(blocked_bots)}. "
+                f"Configure your CDN to allow AI bot User-Agents ({ROBOTS_KEY_BOTS_DISPLAY}).",
+            )
         )
 
     if effective_js.checked and effective_js.js_dependent:
-        recommendations.append(
-            f"⚠️ Content requires JavaScript to render ({effective_js.raw_word_count} words in raw HTML). "
-            "AI crawlers don't execute JS. Implement SSR, SSG, or pre-rendering."
+        categorized.append(
+            (
+                RECOMMENDATION_BLOCKERS_CATEGORY,
+                f"⚠️ Content requires JavaScript to render ({effective_js.raw_word_count} words in raw HTML). "
+                "AI crawlers don't execute JS. Implement SSR, SSG, or pre-rendering.",
+            )
         )
+
+    # The flat list and the per-category view are both derived from the same pairs
+    recommendations = [text for _, text in categorized]
+    recommendations_by_category = group_recommendations_by_category(categorized)
 
     result = AuditResult(
         url=base_url,
@@ -652,6 +803,7 @@ def _build_audit_result(
         content=content,
         citability=citability,
         recommendations=recommendations,
+        recommendations_by_category=recommendations_by_category,
         http_status=http_status,
         page_size=page_size,
         extra_checks=plugin_results,
@@ -673,6 +825,9 @@ def _build_audit_result(
         instruction_readiness=effective_instruction,
         intent_mapping=effective_intent,
         hallucination_bait=effective_hallucination,
+        google_ai=effective_google_ai,
+        score_version=score_version,
+        score_max=dict(CATEGORY_MAX_BY_VERSION[score_version]),
     )
 
     # v4.7: Multi-Platform Citation Profile (#228) — computed post-construction
@@ -696,15 +851,40 @@ def _build_audit_result(
     return result
 
 
-def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> AuditResult:
+def _set_error_recommendations(result: AuditResult, recommendations: list[str]) -> None:
+    """Set the recommendations of an audit that could not analyse the page.
+
+    No category was audited, so none owns the message: it is filed under
+    ``RECOMMENDATION_OTHER_CATEGORY`` to keep ``recommendations_by_category`` consistent
+    with ``recommendations`` (same strings, one group).
+    """
+    result.recommendations = recommendations
+    result.recommendations_by_category = {RECOMMENDATION_OTHER_CATEGORY: list(recommendations)}
+
+
+def _notify(on_step: Callable[[str], None] | None, step: str) -> None:
+    """Segnala l'inizio di una fase reale al chiamante (la CLI mostra il progresso)."""
+    if on_step is not None:
+        on_step(step)
+
+
+def run_full_audit(
+    url: str,
+    use_cache: bool = False,
+    project_config=None,
+    on_step: Callable[[str], None] | None = None,
+    score_version: int = DEFAULT_SCORE_VERSION,
+) -> AuditResult:
     """Run complete audit and return AuditResult with all sub-results, score, band, and recommendations.
 
     Args:
         url: URL of the site to analyze.
         use_cache: If True, use disk cache for HTTP requests.
         project_config: Optional ProjectConfig — if it has extra_bots, merges them with AI_BOTS (fix #120).
+        on_step: Optional callback called with the name of each phase (AUDIT_STEPS) as it starts.
     """
     _t0 = time.perf_counter()
+    _notify(on_step, AUDIT_STEPS[0])
     from bs4 import BeautifulSoup
 
     # Fix #120: if config has extra_bots, merge with AI_BOTS for this audit
@@ -735,7 +915,7 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
             err = None
         else:
             r, err = fetch_url(base_url)  # type: ignore[assignment]
-            if r and not err:
+            if r is not None and not err and r.status_code in (200, 203):
                 cache.put(base_url, r.status_code, r.text, dict(r.headers))
     else:
         r, err = fetch_url(base_url)  # type: ignore[assignment]
@@ -747,8 +927,10 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
         result = AuditResult(
             url=base_url,
             error=str(err) if err else "Connection failed",
+            score_version=score_version,
+            score_max=dict(CATEGORY_MAX_BY_VERSION[score_version]),
         )
-        result.recommendations = [f"Unable to reach {base_url}: {err or 'connection failed'}"]
+        _set_error_recommendations(result, [f"Unable to reach {base_url}: {err or 'connection failed'}"])
         result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
         return result
 
@@ -758,10 +940,12 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
             url=base_url,
             http_status=r.status_code,
             error=f"HTTP {r.status_code}",
+            score_version=score_version,
+            score_max=dict(CATEGORY_MAX_BY_VERSION[score_version]),
         )
-        result.recommendations = [
-            f"Site returned HTTP {r.status_code}. Check for Cloudflare/WAF blocks or server errors."
-        ]
+        _set_error_recommendations(
+            result, [f"Site returned HTTP {r.status_code}. Check for Cloudflare/WAF blocks or server errors."]
+        )
         result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
         return result
 
@@ -771,8 +955,10 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
 
     # Fix #285: compute soup_clean once and pass it to all sub-audits
     # Avoids 3-4 re-parses of the same HTML (saves 50-200ms per page)
+    # #537: also strip <noscript>/<template> — their text is not page copy but
+    # get_text() still includes <noscript>, inflating word counts and boilerplate.
     soup_clean = copy.deepcopy(soup)
-    for tag in soup_clean(["script", "style"]):
+    for tag in soup_clean(["script", "style", "noscript", "template"]):
         tag.decompose()
 
     # Fetch robots.txt, llms.txt, llms-full.txt and AI discovery with local fetch_url
@@ -793,31 +979,48 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
     r_ai_faq, _ = fetch_url(ai_faq_url)
     r_ai_service, _ = fetch_url(ai_service_url)
 
+    _notify(on_step, AUDIT_STEPS[1])
     # Run all sub-audits using the pre-downloaded responses
     # Fix #120: pass effective_bots which includes any extra_bots from project_config
     robots = _audit_robots_from_response(r_robots, bots=effective_bots)
-    llms = _audit_llms_from_response(r_llms, r_full=r_llms_full)
+    llms = _audit_llms_from_response(r_llms, r_full=r_llms_full, url=llms_url_full)
     schema = audit_schema(soup, base_url)
     meta = audit_meta_tags(soup, base_url)
     # gap #2: X-Robots-Tag HTTP header — blocks AI indexing even when robots.txt allows it
     try:
-        _x_robots = dict(r.headers).get("x-robots-tag") or dict(r.headers).get("X-Robots-Tag") or ""
+        response_headers = dict(r.headers)
     except (TypeError, AttributeError):
-        _x_robots = ""
+        response_headers = {}
+    _x_robots = response_headers.get("x-robots-tag") or response_headers.get("X-Robots-Tag") or ""
     if _x_robots:
         meta.x_robots_tag = _x_robots
         if "noindex" in _x_robots.lower():
             meta.x_robots_noindex = True
+    # Check Google AI solo se la rubrica li prevede: in v1 non entrano né nello score né negli output
+    if "google_ai" in CATEGORY_MAX_BY_VERSION[score_version]:
+        google_ai_result = run_google_ai_checks(
+            soup,
+            final_url=str(getattr(r, "url", "") or base_url),
+            http_status=r.status_code,
+            headers=response_headers,
+            robots=robots,
+            schemas=schema.raw_schemas,
+        )
+    else:
+        google_ai_result = GoogleAiReadinessResult()
     content = audit_content_quality(soup, base_url, soup_clean=soup_clean)
 
     # v4.1: AI discovery endpoints audit (usa risposte pre-scaricate)
     ai_disc = _audit_ai_discovery_from_responses(r_ai_txt, r_ai_summary, r_ai_faq, r_ai_service)
+    ai_disc.has_markdown = check_markdown_negotiation(base_url)
 
     # v4.2: CDN AI Crawler check (#225) + JS Rendering check (#226)
+    _notify(on_step, AUDIT_STEPS[2])
     cdn_result = audit_cdn_ai_crawler(base_url)
     js_result = audit_js_rendering(soup, r.text)
 
     # Fix #281: compute technical signals (lang, RSS, freshness)
+    _notify(on_step, AUDIT_STEPS[3])
     signals = audit_signals(soup, schema)
 
     # v4.3: Brand & Entity signals (zero HTTP requests, uses pre-fetched data only)
@@ -827,7 +1030,7 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
     webmcp_result = audit_webmcp_readiness(soup, r.text, schema, ai_disc)
 
     # v4.3: Negative Signals detection — zero HTTP fetch
-    negative_signals_result = audit_negative_signals(soup, r.text, content, meta, schema)
+    negative_signals_result = audit_negative_signals(soup, r.text, content, meta, schema, soup_clean=soup_clean)
 
     # v4.4: Prompt Injection Pattern Detection (#276) — zero HTTP fetch
     from geo_optimizer.core.injection_detector import audit_prompt_injection
@@ -873,6 +1076,8 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
         negative_signals=negative_signals_result,
         prompt_injection=prompt_injection_result,
         trust_stack=trust_stack_result,
+        google_ai=google_ai_result,
+        score_version=score_version,
     )
 
     # gap #10: brand sentiment analysis — opt-in, requires project_config.brand_name
@@ -895,7 +1100,12 @@ def run_full_audit(url: str, use_cache: bool = False, project_config=None) -> Au
     return result
 
 
-async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
+async def run_full_audit_async(
+    url: str,
+    project_config=None,
+    on_step: Callable[[str], None] | None = None,
+    score_version: int = DEFAULT_SCORE_VERSION,
+) -> AuditResult:
     """Async variant of the full audit with parallel fetch (httpx).
 
     Runs homepage, robots.txt and llms.txt in parallel for a
@@ -907,10 +1117,12 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
     Args:
         url: URL of the site to analyze.
         project_config: Optional ProjectConfig — if it has extra_bots, merges them with AI_BOTS.
+        on_step: Optional callback called with the name of each phase (AUDIT_STEPS) as it starts.
 
     Requires: pip install geo-optimizer-skill[async]
     """
     _t0 = time.perf_counter()
+    _notify(on_step, AUDIT_STEPS[0])
     from bs4 import BeautifulSoup
 
     from geo_optimizer.utils.http_async import fetch_urls_async
@@ -957,12 +1169,14 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
     r_ai_faq, _ = responses.get(ai_faq_url, (None, None))
     r_ai_service, _ = responses.get(ai_service_url, (None, None))
 
-    if err_home or not r_home:
+    if err_home or r_home is None:
         result = AuditResult(
             url=base_url,
             error=str(err_home) if err_home else "Connection failed",
+            score_version=score_version,
+            score_max=dict(CATEGORY_MAX_BY_VERSION[score_version]),
         )
-        result.recommendations = [f"Unable to reach {base_url}: {err_home}"]
+        _set_error_recommendations(result, [f"Unable to reach {base_url}: {err_home}"])
         result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
         return result
 
@@ -972,10 +1186,12 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
             url=base_url,
             http_status=r_home.status_code,
             error=f"HTTP {r_home.status_code}",
+            score_version=score_version,
+            score_max=dict(CATEGORY_MAX_BY_VERSION[score_version]),
         )
-        result.recommendations = [
-            f"Site returned HTTP {r_home.status_code}. Check for Cloudflare/WAF blocks or server errors."
-        ]
+        _set_error_recommendations(
+            result, [f"Site returned HTTP {r_home.status_code}. Check for Cloudflare/WAF blocks or server errors."]
+        )
         result.audit_duration_ms = int((time.perf_counter() - _t0) * 1000)
         return result
 
@@ -984,28 +1200,46 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
     soup = BeautifulSoup(r_home.text, "html.parser")
 
     # Fix #285: compute soup_clean once for the async path
+    # #537: strip <noscript>/<template> too (their text is not page copy)
     soup_clean = copy.deepcopy(soup)
-    for tag in soup_clean(["script", "style"]):
+    for tag in soup_clean(["script", "style", "noscript", "template"]):
         tag.decompose()
 
+    _notify(on_step, AUDIT_STEPS[1])
     # Sub-audit robots.txt (uses pre-fetched response with extra_bots)
     robots = _audit_robots_from_response(r_robots, bots=effective_bots)
 
-    # Sub-audit llms.txt (uses pre-fetched response)
-    llms = _audit_llms_from_response(r_llms, r_full=r_llms_full)
+    # Sub-audit llms.txt (uses pre-fetched response). On a CDN/WAF 403/406 it
+    # retries with a browser-like UA through the synchronous fetch_url: run it in
+    # a thread so the retry does not block the event loop (batch audits run many
+    # of these concurrently, and a blocked loop also stops the per-URL timeout).
+    llms = await asyncio.to_thread(_audit_llms_from_response, r_llms, r_full=r_llms_full, url=llms_url)
 
     # Sub-audits that work on the DOM (no additional fetch required)
     schema = audit_schema(soup, base_url)
     meta = audit_meta_tags(soup, base_url)
     # gap #2: X-Robots-Tag HTTP header — blocks AI indexing even when robots.txt allows it
     try:
-        _x_robots_async = dict(r_home.headers).get("x-robots-tag") or dict(r_home.headers).get("X-Robots-Tag") or ""
+        response_headers_async = dict(r_home.headers)
     except (TypeError, AttributeError):
-        _x_robots_async = ""
+        response_headers_async = {}
+    _x_robots_async = response_headers_async.get("x-robots-tag") or response_headers_async.get("X-Robots-Tag") or ""
     if _x_robots_async:
         meta.x_robots_tag = _x_robots_async
         if "noindex" in _x_robots_async.lower():
             meta.x_robots_noindex = True
+    # Check Google AI solo se la rubrica li prevede: in v1 non entrano né nello score né negli output
+    if "google_ai" in CATEGORY_MAX_BY_VERSION[score_version]:
+        google_ai_result = run_google_ai_checks(
+            soup,
+            final_url=str(getattr(r_home, "url", "") or base_url),
+            http_status=r_home.status_code,
+            headers=response_headers_async,
+            robots=robots,
+            schemas=schema.raw_schemas,
+        )
+    else:
+        google_ai_result = GoogleAiReadinessResult()
     content = audit_content_quality(soup, base_url, soup_clean=soup_clean)
 
     # v4.1: AI discovery from pre-fetched responses
@@ -1013,10 +1247,16 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
 
     # v4.2: CDN AI Crawler check (#225) + JS Rendering check (#226)
     # Fix: wrap synchronous calls with asyncio.to_thread to avoid blocking the event loop
-    cdn_result = await asyncio.to_thread(audit_cdn_ai_crawler, base_url)
+    _notify(on_step, AUDIT_STEPS[2])
+    cdn_result, markdown_ok = await asyncio.gather(
+        asyncio.to_thread(audit_cdn_ai_crawler, base_url),
+        check_markdown_negotiation_async(None, base_url),
+    )
+    ai_disc.has_markdown = markdown_ok
     js_result = audit_js_rendering(soup, r_home.text)
 
     # Fix #281: compute technical signals (lang, RSS, freshness)
+    _notify(on_step, AUDIT_STEPS[3])
     signals = audit_signals(soup, schema)
 
     # v4.3: Brand & Entity signals (zero HTTP requests, uses pre-fetched data only)
@@ -1026,7 +1266,7 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
     webmcp_result = audit_webmcp_readiness(soup, r_home.text, schema, ai_disc)
 
     # v4.3: Negative Signals detection — zero HTTP fetch
-    negative_signals_result = audit_negative_signals(soup, r_home.text, content, meta, schema)
+    negative_signals_result = audit_negative_signals(soup, r_home.text, content, meta, schema, soup_clean=soup_clean)
 
     # v4.4: Prompt Injection Pattern Detection (#276) — zero HTTP fetch
     from geo_optimizer.core.injection_detector import audit_prompt_injection
@@ -1072,6 +1312,8 @@ async def run_full_audit_async(url: str, project_config=None) -> AuditResult:
         negative_signals=negative_signals_result,
         prompt_injection=prompt_injection_result,
         trust_stack=trust_stack_result,
+        google_ai=google_ai_result,
+        score_version=score_version,
     )
 
     # gap #10: brand sentiment analysis — opt-in, requires project_config.brand_name

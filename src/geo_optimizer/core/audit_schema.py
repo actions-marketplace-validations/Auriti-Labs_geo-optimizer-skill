@@ -4,7 +4,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from geo_optimizer.models.config import (
+    AI_READINESS_SCHEMA_NAME_MIN_LEN,
     ARTICLE_TYPES,
+    ORGANIZATION_TYPES,
     SCHEMA_ORG_REQUIRED,
     SCHEMA_RAW_SCHEMAS_CAP,
     SCHEMA_RICHNESS_HIGH,
@@ -12,7 +14,8 @@ from geo_optimizer.models.config import (
     SCHEMA_RICHNESS_MED,
 )
 from geo_optimizer.models.results import SchemaResult
-from geo_optimizer.utils.jsonld import iter_jsonld_objects
+from geo_optimizer.utils.jsonld import first_object, iter_jsonld_objects, string_list
+from geo_optimizer.utils.jsonld import schema_types as jsonld_types
 
 if TYPE_CHECKING:
     from bs4 import BeautifulSoup
@@ -36,11 +39,9 @@ def audit_schema(soup: BeautifulSoup | None, url: str) -> SchemaResult:
 
     for schema in iter_jsonld_objects(soup, on_parse_error=_count_parse_error):
         try:
-            schema_type = schema.get("@type", "unknown")
-            if isinstance(schema_type, list):
-                schema_types = schema_type
-            else:
-                schema_types = [schema_type]
+            # Solo i tipi stringa: un @type numerico o a oggetto finiva in found_types
+            # e rompeva i moduli che ne costruiscono un set (es. audit_multimodal).
+            schema_types = jsonld_types(schema.get("@type")) or ["unknown"]
 
             # Add the raw schema (cap at 50 to prevent memory bloat — fix #191)
             if len(result.raw_schemas) < SCHEMA_RAW_SCHEMAS_CAP:
@@ -57,7 +58,7 @@ def audit_schema(soup: BeautifulSoup | None, url: str) -> SchemaResult:
                     result.has_faq = True
                 elif t in ARTICLE_TYPES:
                     result.has_article = True
-                elif t == "Organization":
+                elif t in ORGANIZATION_TYPES:
                     result.has_organization = True
                 elif t == "HowTo":
                     result.has_howto = True
@@ -71,9 +72,7 @@ def audit_schema(soup: BeautifulSoup | None, url: str) -> SchemaResult:
                     result.any_schema_found = True
 
             # Check the sameAs property
-            same_as = schema.get("sameAs", [])
-            if isinstance(same_as, str):
-                same_as = [same_as]
+            same_as = string_list(schema.get("sameAs"))
             if same_as:
                 result.has_sameas = True
                 result.sameas_urls.extend(same_as[:10])  # cap at 10
@@ -109,14 +108,27 @@ def audit_schema(soup: BeautifulSoup | None, url: str) -> SchemaResult:
             result.schema_richness_score = 2
         elif avg >= SCHEMA_RICHNESS_LOW:
             result.schema_richness_score = 1
+
         else:
             result.schema_richness_score = 0
 
+    visible_root = soup.body or soup
+    visible_text = " ".join(
+        str(text)
+        for text in visible_root.find_all(string=True)
+        if text.parent and text.parent.name not in {"script", "style", "noscript", "template", "title"}
+    ).casefold()
+    result.visible_match = any(
+        isinstance(schema.get(field), str)
+        and len(schema[field].strip()) >= AI_READINESS_SCHEMA_NAME_MIN_LEN
+        and schema[field].strip().casefold() in visible_text
+        for schema in result.raw_schemas
+        for field in ("name", "headline")
+    )
+
     # Schema completeness (gap #3): check required fields per SCHEMA_ORG_REQUIRED
     for schema_obj in result.raw_schemas:
-        schema_type_raw = schema_obj.get("@type", "unknown")
-        types_to_check = schema_type_raw if isinstance(schema_type_raw, list) else [schema_type_raw]
-        for t in types_to_check:
+        for t in jsonld_types(schema_obj.get("@type")):
             t_lower = t.lower()
             if t_lower in SCHEMA_ORG_REQUIRED:
                 missing = [f for f in SCHEMA_ORG_REQUIRED[t_lower] if f not in schema_obj]
@@ -127,14 +139,8 @@ def audit_schema(soup: BeautifulSoup | None, url: str) -> SchemaResult:
     # #232: E-commerce GEO Profile — analyze Product schema richness
     if result.has_product:
         for schema_obj in result.raw_schemas:
-            schema_type = schema_obj.get("@type", "")
-            types = schema_type if isinstance(schema_type, list) else [schema_type]
-            if "Product" in types:
-                offers = schema_obj.get("offers") or schema_obj.get("offer", {})
-                if isinstance(offers, list):
-                    offers = offers[0] if offers else {}
-                if not isinstance(offers, dict):
-                    offers = {}
+            if "Product" in jsonld_types(schema_obj.get("@type")):
+                offers = first_object(schema_obj.get("offers") or schema_obj.get("offer"))
                 result.ecommerce_signals = {
                     "has_price": bool(offers.get("price") or offers.get("lowPrice")),
                     "has_availability": bool(offers.get("availability")),

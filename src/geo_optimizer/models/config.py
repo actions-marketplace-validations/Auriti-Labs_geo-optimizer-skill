@@ -16,6 +16,15 @@ USER_AGENT = "GEO-Optimizer/2.0 (https://github.com/auriti-labs/geo-optimizer-sk
 
 HEADERS = {"User-Agent": USER_AGENT}
 
+# Real desktop browser UA, used only to recover a resource that the CDN/WAF
+# blocks for the auditor's User-Agent (e.g. llms.txt behind a bot wall). It is
+# an honest, well-formed browser fingerprint — not a spoofed bot signature — and
+# is deliberately a separate, explicit constant so it is never applied as the
+# default fetch UA (#528 override stays independent).
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 # Process-wide User-Agent override for the generic fetch layer (#528). Resolved
 # once at CLI startup from --user-agent / GEO_USER_AGENT and read by
 # utils/http.py, utils/http_async.py and llms_generator.py via get_headers().
@@ -63,6 +72,23 @@ MAX_TOTAL_URLS: int = 10_000
 
 # Performance budget: warn if a single-page audit exceeds this threshold (#290)
 AUDIT_TIMEOUT_SECONDS: int = 10
+# `geo access` warns above this raw initial-HTML weight (#512). The warning
+# splits it into inline <script>/<style> and the rest, because framework pages
+# often cross it with little page copy (Neurounit, Habr).
+HTML_WEIGHT_WARN_BYTES: int = 200_000
+
+# Hard per-URL deadline in sitemap/batch mode (#556). Distinct from the budget above:
+# that one only logs a warning, this one kills an audit that is genuinely hung.
+# A healthy page can take 15-20s (8 fetches + CDN bot probes), so 10s failed every URL.
+BATCH_URL_TIMEOUT_SECONDS: int = 60
+
+# Fasi reali di run_full_audit / run_full_audit_async, notificate via on_step (progresso CLI)
+AUDIT_STEPS: tuple[str, ...] = (
+    "Fetching page, robots.txt, llms.txt and AI files",
+    "Analyzing schema, meta tags and content",
+    "Checking CDN access for AI bots",
+    "Running trust, brand and extra checks",
+)
 
 GEO_OPTIMIZER_HOME = Path.home() / ".geo-optimizer"
 TRACKING_DB_PATH = GEO_OPTIMIZER_HOME / "tracking.db"
@@ -245,6 +271,78 @@ ARTICLE_TYPES: frozenset[str] = frozenset(
         "NewsArticle",
         "TechArticle",
         "ScholarlyArticle",
+    }
+)
+
+# schema.org Organization subtypes that count as Organization for GEO scoring
+# (entity/trust signals, contact-info validation). Same fix shape as
+# ARTICLE_TYPES/#392: a node typed "LocalBusiness" (or one of its own common
+# subtypes) IS an Organization per schema.org's hierarchy, but was previously
+# only matched by the literal string "Organization" — which most real-world
+# small-business sites never use directly, since LocalBusiness and its
+# subtypes are schema.org's own recommended, more specific types for exactly
+# that audience.
+ORGANIZATION_TYPES: frozenset[str] = frozenset(
+    {
+        "Organization",
+        # Direct schema.org subtypes of Organization
+        "LocalBusiness",
+        "Corporation",
+        "EducationalOrganization",
+        "GovernmentOrganization",
+        "MedicalOrganization",
+        "NGO",
+        "NewsMediaOrganization",
+        "OnlineBusiness",
+        "PerformingGroup",
+        "SportsOrganization",
+        # Common LocalBusiness subtypes used directly as @type
+        "Store",
+        "Restaurant",
+        "FoodEstablishment",
+        "ProfessionalService",
+        "HomeAndConstructionBusiness",
+        "AutomotiveBusiness",
+        "MedicalBusiness",
+        "Dentist",
+        "Attorney",
+        "LegalService",
+        "FinancialService",
+        "RealEstateAgent",
+        "LodgingBusiness",
+        "Hotel",
+        "HealthAndBeautyBusiness",
+        "EntertainmentBusiness",
+        "GovernmentOffice",
+        "Library",
+        # Trades, clinics and shops that local-business sites declare directly as @type.
+        # Without them a site typed only "RoofingContractor" lost its contact and geo signals.
+        "GeneralContractor",
+        "RoofingContractor",
+        "Plumber",
+        "Electrician",
+        "HVACBusiness",
+        "Locksmith",
+        "MovingCompany",
+        "HousePainter",
+        "AccountingService",
+        "InsuranceAgency",
+        "TravelAgency",
+        "Physician",
+        "MedicalClinic",
+        "VeterinaryCare",
+        "BeautySalon",
+        "HairSalon",
+        "DaySpa",
+        "HealthClub",
+        "CafeOrCoffeeShop",
+        "Bakery",
+        "AutoRepair",
+        "AutoDealer",
+        "OnlineStore",
+        "ClothingStore",
+        "School",
+        "CollegeOrUniversity",
     }
 )
 
@@ -564,6 +662,111 @@ CATEGORY_MAX = {
     "ai_discovery": 6,
 }
 
+# Rubric v2 (v4.19) — riallineata alla documentazione Google AI. v1 resta sopra, intatta,
+# per lo storico e per --score-version 1. Stesse chiavi di v1 dove il segnale è lo stesso.
+SCORING_V2 = {
+    "robots_found": 3,
+    "robots_citation_ok": 11,
+    # llms.txt: ignorato da Google Search, utile ad altri agenti → 6 punti
+    "llms_found": 3,
+    "llms_h1": 0,
+    "llms_blockquote": 0,
+    "llms_sections": 1,
+    "llms_links": 1,
+    "llms_depth": 0,
+    "llms_depth_high": 0,
+    "llms_full": 1,
+    "schema_any_valid": 2,
+    "schema_richness": 2,
+    "schema_faq": 2,
+    "schema_article": 2,
+    "schema_organization": 3,
+    "schema_website": 1,
+    "schema_sameas": 0,
+    "schema_visible_match": 2,
+    "meta_title": 5,
+    "meta_description": 2,
+    "meta_canonical": 0,
+    "meta_og": 4,
+    "content_h1": 2,
+    "content_numbers": 1,
+    "content_links": 1,
+    "content_word_count": 1,
+    "content_heading_hierarchy": 3,
+    "content_lists_or_tables": 2,
+    "content_front_loading": 2,
+    "content_images_alt": 2,
+    "signals_lang": 3,
+    "signals_rss": 1,
+    "signals_freshness": 2,
+    "ai_discovery_well_known": 1,
+    "ai_discovery_summary": 1,
+    "ai_discovery_faq": 0,
+    "ai_discovery_service": 0,
+    "ai_discovery_markdown": 1,
+    "brand_entity_coherence": 3,
+    "brand_kg_readiness": 4,
+    "brand_about_contact": 3,
+    "brand_geo_identity": 1,
+    "brand_topic_authority": 1,
+}
+ROBOTS_PARTIAL_SCORE_V2 = 8
+CATEGORY_MAX_V2 = {
+    "google_ai": 20,
+    "robots": 14,
+    "schema": 14,
+    "content": 14,
+    "brand_entity": 12,
+    "meta": 11,
+    "llms": 6,
+    "signals": 6,
+    "ai_discovery": 3,
+}
+# Non-scored keys of ``AuditResult.recommendations_by_category`` (besides the scored categories).
+# "blockers": issues that stop AI crawlers from reading or trusting the page and that are not
+# part of a scored category: the CDN/WAF block, content that needs JavaScript to render, the
+# critical prompt-injection patterns and the critical UGC injection risk.
+RECOMMENDATION_BLOCKERS_CATEGORY = "blockers"
+# "other": everything else without a scored category: the non-critical UGC advisory, negative
+# signals, WebMCP, multimodal, and the error-path messages of an audit that could not analyse
+# the page.
+RECOMMENDATION_OTHER_CATEGORY = "other"
+
+SCORING_BY_VERSION = {1: SCORING, 2: SCORING_V2}
+CATEGORY_MAX_BY_VERSION = {1: CATEGORY_MAX, 2: CATEGORY_MAX_V2}
+ROBOTS_PARTIAL_BY_VERSION = {1: ROBOTS_PARTIAL_SCORE, 2: ROBOTS_PARTIAL_SCORE_V2}
+DEFAULT_SCORE_VERSION = 2
+
+# ─── Google AI readiness (rubric v2) ─────────────────────────────────────────
+# Fonti ufficiali per ogni check G-*: mostrate in report, SARIF helpUri e skill.
+GOOGLE_DOC_URLS = {
+    "G-INDEX": "https://developers.google.com/search/docs/essentials/technical",
+    "G-SNIPPET": "https://developers.google.com/search/docs/crawling-indexing/robots-meta-tag",
+    "G-CANONICAL": "https://developers.google.com/search/docs/crawling-indexing/consolidate-duplicate-urls",
+    "G-DATES": "https://developers.google.com/search/docs/appearance/publication-dates",
+    "G-BYLINE": "https://developers.google.com/search/docs/fundamentals/creating-helpful-content",
+    "G-LINKS": "https://developers.google.com/search/docs/crawling-indexing/javascript/javascript-seo-basics",
+    "G-VIEWPORT": "https://developers.google.com/search/docs/appearance/page-experience",
+    "G-SITEMAP": "https://developers.google.com/search/docs/crawling-indexing/sitemaps/build-sitemap",
+    "G-SD-VISIBLE": "https://developers.google.com/search/docs/appearance/structured-data/sd-policies",
+    "G-GENAI-CONTROL": "https://developers.google.com/search/docs/fundamentals/ai-optimization-guide",
+}
+# Punti per check nella categoria google_ai (somma 20). G-SD-VISIBLE pesa in schema.
+GOOGLE_AI_POINTS = {
+    "G-INDEX": 5,
+    "G-SNIPPET": 5,
+    "G-CANONICAL": 3,
+    "G-DATES": 2,
+    "G-BYLINE": 2,
+    "G-LINKS": 1,
+    "G-VIEWPORT": 1,
+    "G-SITEMAP": 1,
+    "G-GENAI-CONTROL": 0,
+}
+GOOGLE_AI_SNIPPET_MIN = 50  # max-snippet sotto questa soglia = estratto inutilizzabile
+DATA_NOSNIPPET_FAIL_RATIO = 0.5
+DATA_NOSNIPPET_WARN_RATIO = 0.1
+
 # Schema richness thresholds — graduated scoring (#394)
 SCHEMA_RICHNESS_HIGH = 5  # avg >= 5 attrs → full points (3pt)
 SCHEMA_RICHNESS_MED = 4  # avg >= 4 attrs → 2pt
@@ -595,7 +798,7 @@ JS_EMPTY_ROOT_WORDS: int = 200  # empty root + low word count → JS-dependent
 JS_CRITICAL_WORDS: int = 50  # critically low content threshold
 
 # Content freshness thresholds in days (#401)
-# AutoGEO ICLR 2026: tech content < 3 months strongly preferred by AI search engines
+# AutoGEO (arXiv:2510.11438, preprint): tech content < 3 months strongly preferred by AI search engines
 FRESHNESS_VERY_FRESH_DAYS = 90  # < 3 months → very_fresh
 FRESHNESS_FRESH_DAYS = 180  # 3-6 months → fresh
 FRESHNESS_AGING_DAYS = 365  # 6-12 months → aging (> 12 months = stale)
@@ -663,11 +866,29 @@ PROMPT_INJECTION_UNICODE_THRESHOLD = 5
 PROMPT_INJECTION_COMMENT_MAX_LEN = 500
 MICROFONT_SIZE_THRESHOLD_PX = 2.0
 
+# UGC injection surface (#537 follow-up): named third-party comment widgets, and
+# id/class fragments that mark a user-generated content region. Kept narrow to
+# avoid flagging author-written testimonial blocks or generic list containers.
+UGC_WIDGET_MARKERS = [
+    ("disqus_thread", "Disqus embed"),
+    ("fb-comments", "Facebook Comments plugin"),
+    ("commento", "Commento embed"),
+    ("utterances", "utterances (GitHub-issue comments)"),
+    ("giscus", "giscus (GitHub-discussion comments)"),
+    ("hyvor-talk", "Hyvor Talk comments"),
+    ("cusdis_thread", "Cusdis embed"),
+    ("remark42", "Remark42 comments"),
+    ("coral-talk", "Coral (Talk) comments"),
+]
+UGC_SCRIPT_HOSTS = ["disqus.com", "commento.io", "hyvor.com", "cusdis.com", "utteranc.es", "giscus.app"]
+UGC_ID_CLASS_RE = r"(?:^|[-_ ])(?:comment-?list|comments?-?(?:section|area|wrapper|thread)?|respond|review-?list|reviews?-?(?:section|list|wrapper)?|user-?reviews?|discussion-?thread)(?:$|[-_ ])"
+
 # ─── Shared thresholds (fix #388) ────────────────────────────────────────────
 
 # Keyword stuffing threshold: single-word density above which it is considered spam
 # SEMrush 2025 research: > 2.5% is a manipulation signal for AI engines
 KEYWORD_STUFFING_THRESHOLD = 0.025
+KEYWORD_STUFFING_MIN_COUNT = 5  # a word used fewer times is never stuffing, whatever the density
 
 # URL patterns for "about" pages (fix #391)
 ABOUT_LINK_PATTERNS = [
@@ -681,7 +902,63 @@ ABOUT_LINK_PATTERNS = [
     "/who-we-are",
     "/storia",
     "/azienda",
+    # German, French, Spanish/Portuguese and Dutch slugs ("/sobre-nos" also
+    # matches "/sobre-nosotros" through the substring check).
+    "/ueber-uns",
+    "/uber-uns",
+    "/unternehmen",
+    "/a-propos",
+    "/qui-sommes-nous",
+    "/sobre-nos",
+    "/quienes-somos",
+    "/quem-somos",
+    "/over-ons",
+    # In-page anchors — single-page sites (common for small-business marketing
+    # sites) have no dedicated /about URL to link to, only a same-page section
+    # like href="#about". A substring check still applies, so this also
+    # matches longer anchors like "#about-us".
+    "#about",
+    "#manifesto",
+    "#chi-siamo",
+    "#team",
+    "#company",
+    "#mission",
+    "#our-story",
+    "#who-we-are",
+    "#storia",
+    "#azienda",
+    "#ueber-uns",
+    "#uber-uns",
+    "#unternehmen",
+    "#a-propos",
+    "#qui-sommes-nous",
+    "#sobre-nos",
+    "#quienes-somos",
+    "#quem-somos",
+    "#over-ons",
 ]
+
+# Hostnames of third-party form-embed providers whose fields live inside a
+# cross-origin <iframe> — invisible to a static HTML fetch, the same
+# invisible-to-static-crawl limitation as has_webmcp_declaration (#535).
+# These providers build accessible markup (label/aria-label) into their
+# hosted forms by default, so a known-provider embed is credited toward
+# agent-usable forms instead of scoring as "no form found."
+KNOWN_FORM_EMBED_HOSTS = (
+    "tally.so",
+    "typeform.com",
+    "hsforms.com",
+    "hsforms.net",
+    "jotform.com",
+    "forms.gle",
+    "docs.google.com",
+    "airtable.com",
+    "formspree.io",
+    "wufoo.com",
+    "cognitoforms.com",
+    "123formbuilder.com",
+    "paperform.co",
+)
 
 # ─── Trust Stack Score (#273) ─────────────────────────────────────────────────
 
@@ -749,6 +1026,11 @@ AI_DISCOVERY_FAQ_ANSWER_MIN_LEN: int = 20
 
 # Minimum length for service.json name field
 AI_DISCOVERY_SERVICE_NAME_MIN_LEN: int = 3
+
+# Google AI readiness rubric v2 thresholds
+AI_READINESS_IMAGE_ALT_MIN_RATIO: float = 0.9
+AI_READINESS_SCHEMA_NAME_MIN_LEN: int = 3
+AI_READINESS_FUTURE_TOLERANCE_DAYS: int = 1
 
 # ─── Score bands ─────────────────────────────────────────────────────────────
 

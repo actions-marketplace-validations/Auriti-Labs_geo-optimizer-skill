@@ -2,13 +2,17 @@
 import type { GetStaticPaths } from 'astro';
 import Shell from '../../components/Shell.astro';
 import NewsletterSignup from '../../components/NewsletterSignup';
-import ScoreSurface from '../../components/product/ScoreSurface.astro';
 import { guidePrimaryVisuals } from '../../lib/articleVisuals';
 import { getArticlesByCategory, urlForImage } from '../../utils/sanity';
+import { existsSync } from 'node:fs';
 
 export const getStaticPaths = (async ({ paginate }) => {
   const articles = await getArticlesByCategory('guides');
-  return paginate(articles, { pageSize: 6 });
+  // Paginazione disattivata: ~55 guide vivono su un'unica /guides/ (niente
+  // doorway paginate 2..10, già 301 → /guides/). pageSize ampio mantiene il
+  // template (page.*) funzionante e `page.lastPage > 1` non renderizza il nav.
+  // Rivedere quando le guide superano ~400.
+  return paginate(articles, { pageSize: 500 });
 }) satisfies GetStaticPaths;
 
 const { page } = Astro.props;
@@ -16,7 +20,7 @@ const articles = page.data;
 const canonical = `https://geoready.dev/guides/${page.currentPage > 1 ? `${page.currentPage}/` : ''}`;
 const title = page.currentPage > 1
   ? `Guides — Page ${page.currentPage} of ${page.lastPage} — GeoReady`
-  : 'Guides — AI Search Visibility & Generative Engine Optimization';
+  : 'Guides — AI Search Visibility & GEO';
 const guideActionLinks = [
   { href: '/ai-seo-audit/', label: 'AI SEO audit' },
   { href: '/chatgpt-visibility-checker/', label: 'ChatGPT visibility' },
@@ -97,7 +101,7 @@ const guideFaqs = [
   },
   {
     q: 'How do these guides relate to the GEO Optimizer scoring engine?',
-    a: "Each guide maps to specific signals in the open-source GEO Optimizer's 8-category score — the free tool measures whether a site actually implements what a given guide recommends.",
+    a: "Each guide maps to specific signals in the open-source GEO Optimizer's nine-category score — the free tool measures whether a site actually implements what a given guide recommends.",
   },
   {
     q: 'How often are new guides published?',
@@ -105,7 +109,18 @@ const guideFaqs = [
   },
 ] as const;
 
-function getCardImage(article: (typeof articles)[number]) {
+// cover v3 (set coerente, public/images/covers): precede l'immagine Sanity e il diagramma di ripiego
+const coverOf = (slug: string) =>
+  /^[a-z0-9-]+$/.test(slug) && existsSync(`${process.cwd()}/public/images/covers/cover-${slug}-768.webp`) ? `/images/covers/cover-${slug}` : undefined;
+
+function getCardImage(
+  article: (typeof articles)[number],
+): { src: string; alt: string; fit: string; avif?: string } | undefined {
+  const cover = coverOf(article.slug.current);
+  if (cover) {
+    // decorativa: il titolo della card segue subito
+    return { src: `${cover}-768.webp`, avif: `${cover}-768.avif`, alt: '', fit: 'cover' };
+  }
   if (article.ogImage?.asset) {
     return {
       src: urlForImage(article.ogImage).width(640).height(360).fit('crop').auto('format').url(),
@@ -130,197 +145,196 @@ function getCardImage(article: (typeof articles)[number]) {
   description="Practical, no-hype guides on making your website visible and citable to AI answer engines like ChatGPT, Perplexity, Claude, and Gemini."
   canonical={canonical}
 >
-  <div class="max-w-7xl mx-auto px-4 sm:px-6 py-10 md:py-16">
-    {/* Header */}
-    <header class="mb-12 overflow-hidden rounded-[--radius-2xl] border border-border bg-bg-surface md:mb-16">
-      <div class="grid lg:grid-cols-[minmax(0,0.88fr)_minmax(420px,0.82fr)]">
-        <div class="p-6 md:p-10 lg:p-12">
-        <div class="flex items-center gap-2 text-[10px] font-mono text-text-muted uppercase tracking-wider">
-          <span>GeoReady</span>
-          <span class="w-1 h-1 rounded-full bg-text-muted" />
-          <span>Guides</span>
-        </div>
-
-        <h1 class="mt-4 max-w-3xl font-display text-4xl md:text-5xl font-bold text-text-primary leading-tight tracking-tight">
+  {/* Header */}
+  <section class="bg-paper">
+    <div class="mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-20">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
+        <h1 class="max-w-3xl text-[2.3rem] leading-[1.05] tracking-[-0.03em] text-ink sm:text-[3rem]">
           AI visibility guides for people who need the system to make sense.
         </h1>
-
-        <p class="mt-5 max-w-2xl text-base md:text-lg text-text-secondary leading-relaxed">
-          Practical, research-grounded walkthroughs for making your site visible
-          and citable to AI answer engines. No guaranteed-ranking promises — just
-          the technical and content signals that help models find and quote you.
-        </p>
-
-        <div class="mt-8 grid gap-3 sm:grid-cols-3">
-          {[
-            ['01', 'Foundations', 'AI SEO, GEO, llms.txt, and crawler access.'],
-            ['02', 'Citability', 'How answer engines choose sources and references.'],
-            ['03', 'Execution', 'Checklists and implementation paths for real sites.'],
-          ].map(([num, label, text]) => (
-            <div class="border-l border-accent-teal/30 pl-4">
-              <p class="font-mono text-[11px] uppercase tracking-[0.16em] text-accent-teal">{num} {label}</p>
-              <p class="mt-1 text-sm leading-relaxed text-text-secondary">{text}</p>
-            </div>
-          ))}
-        </div>
-
-        <div class="mt-8 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
-          {guideActionLinks.map((link, index) => (
-            <>
-              <a href={link.href} class="text-accent-teal hover:text-accent-teal-dark transition-colors">
-                {link.label}
-              </a>
-              {index < guideActionLinks.length - 1 && <span class="text-text-muted">/</span>}
-            </>
-          ))}
+        <div class="eyebrow">
+          index: guides · {page.total} published
         </div>
       </div>
 
-        <div class="flex items-center border-t border-border bg-bg-subtle p-8 lg:border-l lg:border-t-0">
-          <ScoreSurface variant="light" score={72} band="Good" class="w-full"
-            rows={[
-              { label: 'Access · crawlable', delta: '+18', state: 'good' },
-              { label: 'Structure · llms.txt', delta: '+12', state: 'up' },
-              { label: 'Entity clarity', delta: '+10', state: 'up' },
-              { label: 'Citation signals', delta: '+8', state: 'good' },
-            ]} />
-        </div>
-      </div>
-    </header>
+      <p class="mt-5 max-w-2xl text-base leading-relaxed text-ink-soft md:text-lg">
+        Practical, research-grounded walkthroughs for making your site visible
+        and citable to AI answer engines. No guaranteed-ranking promises — just
+        the technical and content signals that help models find and quote you.
+      </p>
 
-    {/* Guide list */}
-    <ul class="grid gap-4 md:grid-cols-2">
-      {articles.map((a) => {
-        const cardImage = getCardImage(a);
-        return (
-        <li>
-          <a
-            href={`/guides/${a.slug.current}/`}
-            class="group block h-full overflow-hidden rounded-xl border border-border bg-bg-surface transition-colors hover:border-accent-teal/30"
-          >
-            {cardImage ? (
-              <div class="aspect-[16/9] w-full bg-bg-subtle">
-                <img
-                  src={cardImage.src}
-                  alt={cardImage.alt}
-                  width="640"
-                  height="360"
-                  loading="lazy"
-                  decoding="async"
-                  class={`h-full w-full ${cardImage.fit === 'contain' ? 'object-contain p-4 md:p-5' : 'object-cover'}`}
-                />
+      <div class="mt-10 grid gap-px overflow-hidden rounded-[14px] border border-rail bg-rail sm:grid-cols-3">
+        {[
+          ['01', 'Foundations', 'AI SEO, GEO, llms.txt, and crawler access.'],
+          ['02', 'Citability', 'How answer engines choose sources and references.'],
+          ['03', 'Execution', 'Checklists and implementation paths for real sites.'],
+        ].map(([num, label, text]) => (
+          <div class="bg-raised p-5">
+            <p class="font-text text-[12.5px] font-semibold text-pass-deep">{num}</p>
+            <p class="mt-2 text-sm font-semibold text-ink">{label}</p>
+            <p class="mt-1 text-sm leading-relaxed text-ink-soft">{text}</p>
+          </div>
+        ))}
+      </div>
+
+      <div class="mt-8 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+        {guideActionLinks.map((link, index) => (
+          <>
+            <a href={link.href} class="text-pass-deep underline decoration-rail underline-offset-4 transition-colors hover:decoration-pass-deep">
+              {link.label}
+            </a>
+            {index < guideActionLinks.length - 1 && <span class="text-ink-mute">/</span>}
+          </>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  {/* Guide list */}
+  <section class="border-t border-rail bg-raised" data-reveal>
+    <div class="mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-16">
+      <ul class="grid gap-4 md:grid-cols-2">
+        {articles.map((a) => {
+          const cardImage = getCardImage(a);
+          return (
+          <li>
+            <a
+              href={`/guides/${a.slug.current}/`}
+              class="group block h-full overflow-hidden rounded-[14px] border border-rail bg-paper transition-colors hover:border-pass/50"
+            >
+              {cardImage ? (
+                <div class="aspect-[16/9] w-full border-b border-rail bg-raised">
+                  <picture class="block h-full w-full">
+                  {cardImage.avif ? <source type="image/avif" srcset={cardImage.avif} /> : null}
+                  <img
+                    src={cardImage.src}
+                    alt={cardImage.alt}
+                    role={cardImage.alt ? undefined : 'presentation'}
+                    width="640"
+                    height="360"
+                    loading="lazy"
+                    decoding="async"
+                    class={`h-full w-full ${cardImage.fit === 'contain' ? 'object-contain p-4 md:p-5' : 'object-cover'}`}
+                  />
+                  </picture>
+                </div>
+              ) : null}
+              <div class="p-5 md:p-6">
+                <h2 class="text-base leading-snug tracking-[-0.01em] text-ink transition-colors group-hover:text-pass-deep md:text-lg">
+                  {a.title}
+                </h2>
+                <p class="mt-2 text-sm leading-relaxed text-ink-soft md:text-base">
+                  {a.description}
+                </p>
+                <div class="eyebrow mt-4">
+                  published: {new Date(a.datePublished).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
+                </div>
               </div>
-            ) : null}
-            <div class="p-5 md:p-6">
-              <p class="mb-4 text-xs font-mono text-text-muted">
-                {new Date(a.datePublished).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}
-              </p>
-              <h2 class="font-display text-lg md:text-xl font-semibold text-text-primary leading-snug group-hover:text-accent-teal">
-                {a.title}
-              </h2>
-              <p class="mt-2 text-sm md:text-base text-text-secondary leading-relaxed">
-                {a.description}
-              </p>
-            </div>
-          </a>
-        </li>
-        );
-      })}
-    </ul>
+            </a>
+          </li>
+          );
+        })}
+      </ul>
 
-    {/* Pagination */}
-    {page.lastPage > 1 && (
-      <nav class="mt-10 flex items-center justify-between gap-4" aria-label="Guides pagination">
-        {page.url.prev ? (
-          <a
-            href={page.url.prev}
-            class="rounded-lg border border-border px-4 py-2 text-sm font-medium text-text-secondary transition-colors hover:border-accent-teal/30 hover:text-text-primary"
-          >
-            ← Newer
-          </a>
-        ) : <span />}
+      {/* Pagination */}
+      {page.lastPage > 1 && (
+        <nav class="mt-10 flex items-center justify-between gap-4" aria-label="Guides pagination">
+          {page.url.prev ? (
+            <a
+              href={page.url.prev}
+              class="rounded-[9px] border border-rail bg-raised px-4 py-2 font-text text-[12.5px] font-semibold text-ink transition-colors hover:bg-pass-wash"
+            >
+              Newer
+            </a>
+          ) : <span />}
 
-        <div class="flex items-center gap-1.5 font-mono text-xs text-text-muted">
-          {Array.from({ length: page.lastPage }, (_, i) => i + 1).map((n) => (
-            n === page.currentPage ? (
-              <span class="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-teal font-semibold text-white">
-                {n}
-              </span>
-            ) : (
-              <a
-                href={n === 1 ? '/guides/' : `/guides/${n}/`}
-                class="flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-bg-surface hover:text-text-primary"
-              >
-                {n}
-              </a>
-            )
-          ))}
-        </div>
+          <div class="flex items-center gap-1.5 font-mono text-xs text-ink-mute">
+            {Array.from({ length: page.lastPage }, (_, i) => i + 1).map((n) => (
+              n === page.currentPage ? (
+                <span class="flex h-8 w-8 items-center justify-center rounded-[6px] bg-pass-deep font-semibold text-on-accent" aria-current="page">
+                  {n}
+                </span>
+              ) : (
+                <a
+                  href={n === 1 ? '/guides/' : `/guides/${n}/`}
+                  class="flex h-8 w-8 items-center justify-center rounded-[6px] border border-rail transition-colors hover:bg-pass-wash hover:text-ink"
+                >
+                  {n}
+                </a>
+              )
+            ))}
+          </div>
 
-        {page.url.next ? (
-          <a
-            href={page.url.next}
-            class="rounded-lg border border-border px-4 py-2 text-sm font-medium text-text-secondary transition-colors hover:border-accent-teal/30 hover:text-text-primary"
-          >
-            Older →
-          </a>
-        ) : <span />}
-      </nav>
-    )}
+          {page.url.next ? (
+            <a
+              href={page.url.next}
+              class="rounded-[9px] border border-rail bg-raised px-4 py-2 font-text text-[12.5px] font-semibold text-ink transition-colors hover:bg-pass-wash"
+            >
+              Older
+            </a>
+          ) : <span />}
+        </nav>
+      )}
+    </div>
+  </section>
 
-    {/* Tools — strumenti gratuiti collegati alle guide */}
-    <section class="mt-12 border-t border-border pt-10 md:mt-16 md:pt-12">
+  {/* Tools — strumenti gratuiti collegati alle guide */}
+  <section class="border-t border-rail bg-paper" data-reveal>
+    <div class="mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-16">
       <div class="grid gap-6 md:grid-cols-[minmax(0,0.55fr)_minmax(0,1fr)] md:items-start">
         <div>
-          <p class="font-mono text-[11px] uppercase tracking-[0.18em] text-accent-teal">From guide to action</p>
-          <h2 class="mt-2 font-display text-2xl font-semibold text-text-primary">Free tools</h2>
-          <p class="mt-3 text-sm leading-relaxed text-text-secondary">
+          <h2 class="font-head text-2xl tracking-[-0.02em] text-ink">Free tools</h2>
+          <p class="mt-3 text-sm leading-relaxed text-ink-soft">
             Use the tools when a guide turns into an implementation task.
           </p>
+          <div class="eyebrow mt-3">
+            cost: $0 · no account
+          </div>
         </div>
-        <ul class="grid gap-4 sm:grid-cols-2">
+        <ul class="grid gap-px overflow-hidden rounded-[14px] border border-rail bg-rail sm:grid-cols-2">
           {guideToolCards.map((tool) => (
-            <li>
+            <li class="bg-raised">
               <a
                 href={tool.href}
                 data-cta={tool.dataCta}
-                class="block h-full rounded-[--radius-lg] border border-border bg-bg-surface p-5 md:p-6 transition-colors hover:border-accent-teal/30"
+                class="block h-full p-5 transition-colors hover:bg-pass-wash/40 md:p-6"
               >
-                <h3 class="font-display text-base md:text-lg font-semibold text-text-primary leading-snug">
+                <h3 class="text-base font-semibold leading-snug text-ink">
                   {tool.title}
                 </h3>
-                <p class="mt-2 text-sm md:text-base text-text-secondary leading-relaxed">
+                <p class="mt-2 text-sm leading-relaxed text-ink-soft">
                   {tool.copy}
                 </p>
-                <p class="mt-3 text-xs font-mono text-text-muted">{tool.meta}</p>
+                <div class="eyebrow mt-3">{tool.meta}</div>
               </a>
             </li>
           ))}
         </ul>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <section class="mt-12 border-t border-border pt-10 md:mt-16 md:pt-12">
+  <section class="border-t border-rail bg-raised" data-reveal>
+    <div class="mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-16">
       <div class="grid gap-6 md:grid-cols-[minmax(0,0.55fr)_minmax(0,1fr)] md:items-start">
         <div>
-          <p class="font-mono text-[11px] uppercase tracking-[0.18em] text-accent-teal">High-intent paths</p>
-          <h2 class="mt-2 font-display text-2xl font-semibold text-text-primary">Pages for commercial questions</h2>
-          <p class="mt-3 text-sm leading-relaxed text-text-secondary">
+          <h2 class="font-head text-2xl tracking-[-0.02em] text-ink">Pages for commercial questions</h2>
+          <p class="mt-3 text-sm leading-relaxed text-ink-soft">
             Use these when the guide topic maps to a buyer, SaaS, WordPress, or monitoring workflow.
           </p>
         </div>
-        <ul class="grid gap-4 sm:grid-cols-2">
+        <ul class="grid gap-px overflow-hidden rounded-[14px] border border-rail bg-rail sm:grid-cols-2">
           {guideIntentCards.map((item) => (
-            <li>
+            <li class="bg-paper">
               <a
                 href={item.href}
                 data-cta={item.dataCta}
-                class="block h-full rounded-[--radius-lg] border border-border bg-bg-surface p-5 md:p-6 transition-colors hover:border-accent-teal/30"
+                class="block h-full p-5 transition-colors hover:bg-pass-wash/40 md:p-6"
               >
-                <h3 class="font-display text-base md:text-lg font-semibold text-text-primary leading-snug">
+                <h3 class="text-base font-semibold leading-snug text-ink">
                   {item.title}
                 </h3>
-                <p class="mt-2 text-sm md:text-base text-text-secondary leading-relaxed">
+                <p class="mt-2 text-sm leading-relaxed text-ink-soft">
                   {item.copy}
                 </p>
               </a>
@@ -328,33 +342,37 @@ function getCardImage(article: (typeof articles)[number]) {
           ))}
         </ul>
       </div>
-    </section>
+    </div>
+  </section>
 
-    {page.currentPage === 1 && (
-      <section class="mt-12 border-t border-border pt-10 md:mt-16 md:pt-12" aria-labelledby="guides-faq-heading">
-        <h2 id="guides-faq-heading" class="font-display text-2xl font-semibold text-text-primary">
+  {page.currentPage === 1 && (
+    <section class="border-t border-rail bg-paper" data-reveal aria-labelledby="guides-faq-heading">
+      <div class="mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-16">
+        <h2 id="guides-faq-heading" class="font-head text-2xl tracking-[-0.02em] text-ink">
           Frequently asked questions
         </h2>
-        <div class="mt-6 space-y-6">
+        <div class="panel mt-6 divide-y divide-rail overflow-hidden">
           {guideFaqs.map((faq) => (
-            <div>
-              <h3 class="font-display text-lg font-semibold text-text-primary">{faq.q}</h3>
-              <p class="mt-2 text-sm md:text-base leading-relaxed text-text-secondary">{faq.a}</p>
+            <div class="p-6">
+              <h3 class="text-base font-semibold text-ink">{faq.q}</h3>
+              <p class="mt-2 max-w-3xl text-sm leading-relaxed text-ink-soft md:text-base">{faq.a}</p>
             </div>
           ))}
         </div>
-      </section>
-    )}
+      </div>
+    </section>
+  )}
 
-    <section class="mt-12">
+  <section class="border-t border-rail bg-raised" data-reveal>
+    <div class="mx-auto max-w-7xl px-4 py-12 sm:px-6">
       <NewsletterSignup
         client:visible
         source="newsletter-guides"
         title="New guides + State of GEO data, monthly"
         detail="One substantive email a month: new GEO guides, fresh benchmark findings, and what changed in AI search. No spam."
       />
-    </section>
-  </div>
+    </div>
+  </section>
 
   {page.currentPage === 1 && (
     <script type="application/ld+json" set:html={JSON.stringify({

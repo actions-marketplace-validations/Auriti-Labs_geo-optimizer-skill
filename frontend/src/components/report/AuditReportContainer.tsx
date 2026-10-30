@@ -2,8 +2,9 @@ import React, { useEffect, useState } from 'react';
 import { trackAuditCompleted, trackCtaClicked } from '../../lib/geo_track';
 import { fetchAuditReport } from '../../lib/api';
 import { mockAuditReport } from '../../lib/mockData';
-import type { AuditReport, CategoryScore, Recommendation } from '../../lib/mockData';
+import type { AuditReport, CategoryScore } from '../../lib/mockData';
 import { saveScore } from '../../lib/scoreHistory';
+import { estimateAfterFreeFixes, type CategoryGain } from '../../lib/reportEstimate';
 import ReportHeader from './ReportHeader';
 import ScoreGauge from './ScoreGauge';
 import ScoreHistory from './ScoreHistory';
@@ -17,52 +18,10 @@ import ExportActions from './ExportActions';
 const FREE_SLUGS = new Set(['robots', 'meta', 'signals']);
 const ALL_LOCKED_SLUGS = ['llms', 'schema', 'content', 'ai_discovery', 'brand_entity'];
 
-const categoryAction: Record<string, { label: string; detail: string }> = {
-  robots: {
-    label: 'Fix crawler access first',
-    detail: 'AI systems cannot cite pages they are blocked from reaching. Check robots.txt, X-Robots-Tag, and AI crawler directives before rewriting content.',
-  },
-  llms: {
-    label: 'Publish an llms.txt source map',
-    detail: 'Expose your best pages, product facts, pricing pages, docs, and canonical resources in one file that answer engines can parse quickly.',
-  },
-  schema: {
-    label: 'Add machine-readable schema',
-    detail: 'Ship Organization, WebSite, Article, Product, and FAQ JSON-LD where relevant so engines can resolve what the page, brand, and offer are.',
-  },
-  meta: {
-    label: 'Stabilize page metadata',
-    detail: 'Canonical URLs, titles, descriptions, and Open Graph tags reduce ambiguity when engines choose which URL or snippet to trust.',
-  },
-  content: {
-    label: 'Rewrite for extractable answers',
-    detail: 'Lead important sections with direct answers, add concrete facts, and split long explanations into self-contained blocks that can be cited.',
-  },
-  signals: {
-    label: 'Monitor freshness signals',
-    detail: 'Keep sitemap, feeds, dates, and core technical signals consistent so score regressions are visible before rankings or citations drop.',
-  },
-  ai_discovery: {
-    label: 'Expose AI discovery endpoints',
-    detail: 'Add /.well-known/ai.txt, summary files, and FAQ-style resources so answer engines can discover the site beyond standard HTML crawling.',
-  },
-  brand_entity: {
-    label: 'Strengthen entity resolution',
-    detail: 'Connect the brand, authors, social profiles, contact page, and sameAs references so engines can identify the company consistently.',
-  },
-};
-
-const priorityRank: Record<Recommendation['priority'], number> = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3,
-};
-
 type RecommendedPlan = {
-  id: 'pro' | 'studio';
-  name: 'Pro' | 'Studio';
-  price: '$19' | '$49';
+  id: 'pro' | 'agency';
+  name: 'Pro' | 'Agency';
+  price: '$19' | '$89';
   cta: string;
   headline: string;
   reason: string;
@@ -76,7 +35,7 @@ const planByCategory: Record<string, RecommendedPlan> = {
     price: '$19',
     cta: 'Start Pro monitoring',
     headline: 'Start with Pro to keep technical GEO signals from regressing.',
-    reason: 'This looks like a technical visibility problem. Pro is the right first upgrade when you need weekly checks, score history, PDF export, and regression alerts for one domain.',
+    reason: 'This looks like a technical visibility problem. Pro is the right first upgrade when you need weekly checks, score history, PDF export, and regression alerts for up to 10 domains.',
     intent: 'technical_monitoring',
   },
   llms: {
@@ -103,7 +62,7 @@ const planByCategory: Record<string, RecommendedPlan> = {
     price: '$19',
     cta: 'Start Pro monitoring',
     headline: 'Start with Pro to keep metadata and canonical signals stable.',
-    reason: 'Metadata issues affect both classic SEO and AI answer extraction. Pro is enough when the main job is catching technical drift on one domain.',
+    reason: 'Metadata issues affect both classic SEO and AI answer extraction. Pro is enough when the main job is catching technical drift on up to 10 domains.',
     intent: 'metadata_monitoring',
   },
   signals: {
@@ -116,30 +75,30 @@ const planByCategory: Record<string, RecommendedPlan> = {
     intent: 'freshness_monitoring',
   },
   content: {
-    id: 'studio',
-    name: 'Studio',
-    price: '$49',
-    cta: 'Start Studio tracking',
-    headline: 'Use Studio when the gap is citation quality, not just crawlability.',
-    reason: 'Content gaps need more than a weekly technical score. Studio adds AI citation tracking, competitor comparison, and client-ready exports so you can see whether answer engines actually mention and cite you.',
+    id: 'agency',
+    name: 'Agency',
+    price: '$89',
+    cta: 'Start Agency tracking',
+    headline: 'Use Agency when the gap is citation quality, not just crawlability.',
+    reason: 'Content gaps need more than a weekly technical score. Agency adds AI citation tracking, competitor comparison, and client-ready exports so you can see whether answer engines actually mention and cite you.',
     intent: 'citation_tracking',
   },
   ai_discovery: {
-    id: 'studio',
-    name: 'Studio',
-    price: '$49',
-    cta: 'Start Studio tracking',
-    headline: 'Use Studio to track whether AI engines discover and cite the site.',
-    reason: 'Discovery issues sit between technical access and answer-engine presence. Studio is the better fit when you need citation checks and competitor context, not only monitoring.',
+    id: 'agency',
+    name: 'Agency',
+    price: '$89',
+    cta: 'Start Agency tracking',
+    headline: 'Use Agency to track whether AI engines discover and cite the site.',
+    reason: 'Discovery issues sit between technical access and answer-engine presence. Agency is the better fit when you need citation checks and competitor context, not only monitoring.',
     intent: 'ai_discovery_tracking',
   },
   brand_entity: {
-    id: 'studio',
-    name: 'Studio',
-    price: '$49',
-    cta: 'Start Studio tracking',
-    headline: 'Use Studio when entity authority is the blocker.',
-    reason: 'Brand and entity gaps show up in whether answer engines mention you against competitors. Studio adds citation tracking and comparison workflows for that job.',
+    id: 'agency',
+    name: 'Agency',
+    price: '$89',
+    cta: 'Start Agency tracking',
+    headline: 'Use Agency when entity authority is the blocker.',
+    reason: 'Brand and entity gaps show up in whether answer engines mention you against competitors. Agency adds citation tracking and comparison workflows for that job.',
     intent: 'entity_citation_tracking',
   },
 };
@@ -151,7 +110,7 @@ interface AuditReportContainerProps {
 type State =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ready'; report: AuditReport; claim_token: string | null; expires_at: string | null };
+  | { status: 'ready'; report: AuditReport; claim_token: string | null; expires_at: string | null; repeat_count: number | null };
 
 function categoryRatio(category: CategoryScore): number {
   if (category.maxScore <= 0) return 1;
@@ -159,14 +118,10 @@ function categoryRatio(category: CategoryScore): number {
 }
 
 function findWeakestCategory(categories: CategoryScore[]): CategoryScore | null {
-  if (categories.length === 0) return null;
-  return [...categories].sort((a, b) => categoryRatio(a) - categoryRatio(b))[0];
-}
-
-function topRecommendations(recommendations: Recommendation[]): Recommendation[] {
-  return [...recommendations]
-    .sort((a, b) => priorityRank[a.priority] - priorityRank[b.priority])
-    .slice(0, 3);
+  // Una categoria bloccata non va citata: la sua scheda mostra "??"
+  const visible = categories.filter((c) => !c.locked);
+  if (visible.length === 0) return null;
+  return [...visible].sort((a, b) => categoryRatio(a) - categoryRatio(b))[0];
 }
 
 function recommendedPlanFor(category: CategoryScore | null): RecommendedPlan {
@@ -203,96 +158,198 @@ function pricingHref(claimToken: string | null): string {
   return `/pricing/?${params.toString()}`;
 }
 
+function claimHref(claimToken: string | null): string {
+  const params = new URLSearchParams({
+    onboarding: claimToken ? 'claim_report' : 'first_domain',
+    utm_source: 'audit_report',
+    utm_medium: 'result_cta',
+    utm_campaign: 'free_claim',
+  });
+  if (claimToken) {
+    params.set('claim', claimToken);
+    params.set('claim_source', 'free_audit_report');
+  }
+  return `https://app.geoready.dev/signup?${params.toString()}`;
+}
+
+/** URL della report page che riesegue l'audit dello stesso indirizzo. */
+function rerunHref(url: string): string {
+  return `/report/audit/?url=${encodeURIComponent(url)}`;
+}
+
+/** "Robots.txt +14, Meta Tags +6 and Signals +3" */
+function formatGains(gains: CategoryGain[]): string {
+  const parts = gains.map((g) => `${g.name} +${g.points}`);
+  if (parts.length <= 1) return parts.join('');
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/**
+ * Pannello "prossimo passo" del report.
+ *
+ * Ordine voluto (revisione del funnel del 13/10): prima cosa si recupera
+ * gratis e come verificarlo, poi il claim gratuito, e solo dopo l'offerta a
+ * pagamento. La stima è aritmetica sui dati dell'audit (vedi reportEstimate.ts).
+ */
 function ReportNextStep({
   report,
   claimToken,
-  criticalCount,
-  highCount,
+  repeatCount,
 }: {
   report: AuditReport;
   claimToken: string | null;
-  criticalCount: number;
-  highCount: number;
+  repeatCount: number | null;
 }) {
   const weakest = findWeakestCategory(report.categories);
-  const action = weakest ? categoryAction[weakest.slug] : null;
   const plan = recommendedPlanFor(weakest);
-  const recs = topRecommendations(report.recommendations);
-  const openIssues = criticalCount + highCount;
+  const estimate = estimateAfterFreeFixes(report);
+  const lockedNames = report.categories.filter((c) => c.locked && c.score < c.maxScore).map((c) => c.name);
+  const hasGain = estimate.ceiling > estimate.baseline;
+
+  // Recurring-need CTA per i re-auditor: repeatCount è reale, contato
+  // server-side dagli anonymous_reports.
+  const isRepeat = repeatCount !== null && repeatCount >= 1;
+  const host = report.url.replace(/^https?:\/\//, '').split('/')[0];
+  const ordinal = repeatCount === 1 ? 'Second' : repeatCount === 2 ? 'Third' : `${(repeatCount ?? 0) + 1}th`;
 
   return (
-    <section className="rounded-xl border border-accent-teal/25 bg-accent-teal/5 p-5 md:p-6">
-      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-5">
-        <div className="max-w-3xl">
-          <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono uppercase tracking-wider text-accent-teal">
-            <span>Recommended next step</span>
-            <span className="w-1 h-1 rounded-full bg-accent-teal/70" />
-            <span>{plan.name} {plan.price}/mo</span>
-            {openIssues > 0 && (
-              <>
-                <span className="w-1 h-1 rounded-full bg-accent-teal/70" />
-                <span>{openIssues} critical or high issues</span>
-              </>
-            )}
-          </div>
+    <section className="overflow-hidden rounded-[10px] border border-pass/50 bg-pass-wash/60">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-pass/30 px-5 py-2.5">
+        <span className="font-text text-[12.5px] font-semibold text-pass-deep">
+          Your baseline
+        </span>
+        <span className="font-text font-medium text-[12.5px] text-pass-deep">
+          {estimate.freeFixCount} free {estimate.freeFixCount === 1 ? 'fix' : 'fixes'} on this page
+        </span>
+      </div>
 
-          <h2 className="mt-2 text-xl md:text-2xl font-bold text-text-primary leading-tight">
-            {plan.headline}
-          </h2>
-
-          <p className="mt-3 text-sm md:text-base text-text-secondary leading-relaxed">
-            {weakest && action ? (
+      <div className="space-y-6 p-5 md:p-6">
+        {/* Baseline → tetto stimato */}
+        <div>
+          <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1 font-head font-semibold tracking-[-0.02em] text-ink">
+            <span className="text-3xl tabular-nums md:text-4xl">
+              {estimate.baseline}
+              <span className="text-lg text-ink-mute">/100</span>
+            </span>
+            {hasGain && (
               <>
-                The weakest area is <strong className="text-text-primary">{weakest.name}</strong>
-                {' '}at <strong className="text-text-primary">{weakest.score}/{weakest.maxScore}</strong>.
-                {' '}{action.detail}
-                {' '}{plan.reason}
+                <span className="text-xl text-ink-mute" aria-hidden="true">→</span>
+                <span className="text-3xl tabular-nums text-pass-deep md:text-4xl">
+                  <span className="mr-1 align-middle font-text text-[12.5px] font-semibold">up to</span>
+                  {estimate.ceiling}
+                  <span className="text-lg text-ink-mute">/100</span>
+                </span>
               </>
-            ) : (
-              plan.reason
             )}
           </p>
-
-          {recs.length > 0 && (
-            <ul className="mt-4 grid gap-2 text-sm text-text-secondary sm:grid-cols-3">
-              {recs.map((rec) => (
-                <li key={rec.id} className="flex gap-2 leading-snug">
-                  <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-accent-teal" />
-                  <span>{rec.title}</span>
-                </li>
-              ))}
-            </ul>
-          )}
+          <p className="mt-2 max-w-3xl text-sm leading-relaxed text-ink-soft md:text-base">
+            {hasGain ? (
+              <>
+                If every free fix on this page lands: {formatGains(estimate.freeGains)}.
+              </>
+            ) : (
+              <>The categories with free fixes on this page are already at their maximum.</>
+            )}
+            {estimate.lockedGain > 0 && lockedNames.length > 0 && (
+              <>
+                {' '}Another {estimate.lockedGain} points sit in {lockedNames.join(', ')}, whose fix details are part of Pro.
+              </>
+            )}
+          </p>
+          <p className="mt-1 max-w-3xl text-xs leading-relaxed text-ink-mute">
+            How this is computed: your current score plus the points still missing in the categories whose fixes are
+            listed here. It is a ceiling, not a forecast.
+          </p>
         </div>
 
-        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row lg:flex-col">
+        {/* Loop gratuito: correggi → ri-verifica → segui il punteggio */}
+        <ol className="grid gap-px overflow-hidden rounded-[10px] border border-rail bg-rail sm:grid-cols-3">
+          <li className="bg-raised p-4">
+            <div className="font-text text-[12.5px] font-semibold text-pass-deep">1 · Fix</div>
+            <p className="mt-1 text-sm leading-snug text-ink-soft">
+              Apply the fixes listed under Recommendations. They are free and need no account.
+            </p>
+          </li>
+          <li className="bg-raised p-4">
+            <div className="font-text text-[12.5px] font-semibold text-pass-deep">2 · Re-run</div>
+            <p className="mt-1 text-sm leading-snug text-ink-soft">
+              Audit the same URL again, free. Results are cached for about an hour, so re-run after your change is live.
+            </p>
+            <a
+              href={rerunHref(report.url)}
+              onClick={() => trackCtaClicked({ cta_location: 'audit_report_loop', cta_text: 'Re-run audit' })}
+              className="mt-2 inline-flex font-text text-[12.5px] font-semibold text-pass-deep underline decoration-rail underline-offset-4 hover:decoration-pass-deep"
+            >
+              Re-run audit
+            </a>
+          </li>
+          <li className="bg-raised p-4">
+            <div className="font-text text-[12.5px] font-semibold text-pass-deep">3 · Watch it climb</div>
+            <p className="mt-1 text-sm leading-snug text-ink-soft">
+              This browser keeps your score history. Claim the report to keep it in your account, with a weekly re-check.
+            </p>
+          </li>
+        </ol>
+
+        {/* Claim gratuito, separato dall'offerta a pagamento */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="max-w-2xl">
+            <p className="text-sm font-semibold text-ink">
+              {isRepeat ? `${ordinal} audit of ${host}?` : 'Keep this baseline.'}
+            </p>
+            <p className="mt-0.5 text-sm leading-relaxed text-ink-soft">
+              {isRepeat
+                ? 'You are re-checking this site by hand. A free account keeps your last 5 audits and runs one real AI answer check a week. Weekly re-audits and drift alerts start on Pro.'
+                : 'A free account saves this report, keeps your last 5 audits and runs one real AI answer check a week, so you can see how AI engines talk about the site. Weekly re-audits start on Pro.'}
+            </p>
+          </div>
           <a
-            href={planSignupHref(plan, claimToken)}
-            data-plan-id={plan.id}
-            data-plan-name={plan.name}
-            data-plan-period="monthly"
-            data-plan-price={plan.price}
-            data-plan-currency="USD"
-            data-cta-location="audit_report_next_step"
-            className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-accent-teal px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-accent-teal-dark"
+            href={claimHref(claimToken)}
+            data-cta-location="audit_report_claim_free"
+            onClick={() =>
+              trackCtaClicked({
+                cta_location: 'audit_report_claim_free',
+                cta_text: claimToken ? 'Claim this report' : 'Track this domain',
+              })
+            }
+            className="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-[10px] bg-pass-deep px-5 py-2.5 font-text text-[13px] font-semibold text-on-accent transition-colors hover:bg-pass"
           >
-            {plan.cta}
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            {claimToken ? 'Claim this report — free' : 'Track this domain — free'}
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M5 12h14M12 5l7 7-7 7" />
             </svg>
           </a>
-          <a
-            href={pricingHref(claimToken)}
-            data-cta="audit_report_next_step_pricing"
-            className="inline-flex min-h-11 items-center justify-center rounded-lg border border-border bg-bg-surface px-5 py-2.5 text-sm font-semibold text-text-primary transition-colors hover:bg-bg-subtle"
-          >
-            Compare plans
-          </a>
-          <p className="max-w-xs text-xs leading-relaxed text-text-muted">
-            {claimToken
-              ? 'Signup carries this report into the app so the first paid action is claiming the audited domain.'
-              : 'After signup, the app opens on the first-domain monitoring step.'}
+        </div>
+
+        {/* Offerta a pagamento: dopo il percorso gratuito */}
+        <div className="flex flex-col gap-3 border-t border-pass/30 pt-4 sm:flex-row sm:items-center sm:justify-between">
+          <p className="max-w-2xl text-sm leading-relaxed text-ink-soft">
+            <span className="font-semibold text-ink">
+              Want it watched for you? {plan.name} {plan.price}/mo.
+            </span>{' '}
+            {plan.headline}
           </p>
+          <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+            <a
+              href={planSignupHref(plan, claimToken)}
+              data-plan-id={plan.id}
+              data-plan-name={plan.name}
+              data-plan-period="monthly"
+              data-plan-price={plan.price}
+              data-plan-currency="USD"
+              data-cta-location="audit_report_next_step"
+              className="inline-flex min-h-11 items-center justify-center rounded-[10px] border border-pass-deep bg-raised px-5 py-2.5 font-text text-[13px] font-semibold text-pass-deep transition-colors hover:bg-pass-wash"
+            >
+              {plan.cta}
+            </a>
+            <a
+              href={pricingHref(claimToken)}
+              data-cta="audit_report_next_step_pricing"
+              className="inline-flex min-h-11 items-center justify-center rounded-[10px] border border-rail bg-raised px-5 py-2.5 font-text text-[13px] font-semibold text-ink transition-colors hover:bg-pass-wash"
+            >
+              Compare plans
+            </a>
+          </div>
         </div>
       </div>
     </section>
@@ -302,7 +359,7 @@ function ReportNextStep({
 export default function AuditReportContainer({ reportId }: AuditReportContainerProps) {
   const [state, setState] = useState<State>(() =>
     reportId === 'demo'
-      ? { status: 'ready', report: mockAuditReport, claim_token: null, expires_at: null }
+      ? { status: 'ready', report: mockAuditReport, claim_token: null, expires_at: null, repeat_count: null }
       : { status: 'loading' }
   );
 
@@ -336,7 +393,13 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
       if (result.error) {
         setState({ status: 'error', message: result.error });
       } else if (result.report) {
-        setState({ status: 'ready', report: result.report, claim_token: result.claim_token, expires_at: result.expires_at });
+        setState({
+          status: 'ready',
+          report: result.report,
+          claim_token: result.claim_token,
+          expires_at: result.expires_at,
+          repeat_count: result.repeat_count,
+        });
         trackAuditCompleted({
           score: result.report.geoScore,
           score_band: result.report.grade ?? 'unknown',
@@ -356,8 +419,8 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
   if (state.status === 'loading') {
     return (
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-12 text-center">
-        <div className="inline-flex items-center gap-2 text-sm text-text-muted">
-          <svg className="animate-spin w-4 h-4 text-accent-teal" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <div className="inline-flex items-center gap-2 font-mono text-[13px] text-ink-mute">
+          <svg className="animate-spin w-4 h-4 text-pass-deep" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-20" />
             <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="4" strokeLinecap="round" />
           </svg>
@@ -370,9 +433,14 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
   if (state.status === 'error') {
     return (
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-12">
-        <div className="p-5 rounded-xl border border-accent-danger/20 bg-accent-danger/5 text-accent-danger text-sm">
-          <div className="font-semibold mb-1">Audit failed</div>
-          {state.message}
+        <div className="flex items-start gap-3 rounded-[10px] border border-fail/30 bg-fail-wash px-4 py-3 text-sm text-fail">
+          <span aria-hidden="true" className="mt-0.5 font-text text-[12.5px] font-semibold">
+            err
+          </span>
+          <div>
+            <div className="font-semibold mb-1">Audit failed</div>
+            {state.message}
+          </div>
         </div>
       </div>
     );
@@ -381,10 +449,11 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
   const report = state.report;
 
   const isDemo = reportId === 'demo';
-  // All categories are visible on screen: the free report is complete, matching
-  // the public API and the pricing promise ("no email required"). Email capture
-  // below is optional (send-me-a-copy), not a gate.
-  const lockedSlugs: string[] = [];
+  // The free report is meant to be complete ("no email required"); email capture
+  // below is optional (send-me-a-copy), not a gate. If the backend still sends a
+  // gated payload, its locked categories are shown as locked instead of being
+  // rendered as failed checks from missing data.
+  const lockedSlugs: string[] = report.categories.filter((c) => c.locked).map((c) => c.slug);
   const lockedSet = new Set(lockedSlugs);
 
   const criticalCount = report.recommendations.filter((r) => r.priority === 'critical').length;
@@ -407,59 +476,61 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
         highCount={highCount}
       />
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div className="p-4 rounded-lg border border-border bg-bg-surface">
-          <div className="text-[10px] font-mono uppercase tracking-wider text-text-muted">Categories</div>
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-rail bg-rail sm:grid-cols-4">
+        <div className="bg-raised p-4">
+          <div className="font-text text-[12px] font-semibold text-ink-mute">Categories</div>
           <div className="mt-1 font-mono text-lg font-semibold tabular-nums">
-            <span className="text-text-primary">{activeCategories}</span>
-            <span className="text-text-muted text-sm"> / {report.categories.length}</span>
+            <span className="text-ink">{activeCategories}</span>
+            <span className="text-sm text-ink-mute"> / {report.categories.length}</span>
           </div>
-          <div className="text-[10px] text-text-muted mt-0.5">active</div>
+          <div className="mt-0.5 font-mono text-[10px] text-ink-mute">active</div>
         </div>
-        <div className="p-4 rounded-lg border border-border bg-bg-surface">
-          <div className="text-[10px] font-mono uppercase tracking-wider text-text-muted">Recommendations</div>
-          <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-text-primary">{report.recommendations.length}</div>
-          <div className="text-[10px] text-text-muted mt-0.5">{criticalCount} critical</div>
+        <div className="bg-raised p-4">
+          <div className="font-text text-[12px] font-semibold text-ink-mute">Recommendations</div>
+          <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-ink">{report.recommendations.length}</div>
+          <div className="mt-0.5 font-mono text-[10px] text-ink-mute">{criticalCount} critical</div>
         </div>
-        <div className="p-4 rounded-lg border border-border bg-bg-surface">
-          <div className="text-[10px] font-mono uppercase tracking-wider text-text-muted">Signals</div>
+        <div className="bg-raised p-4">
+          <div className="font-text text-[12px] font-semibold text-ink-mute">Signals</div>
           <div className="mt-1 font-mono text-lg font-semibold tabular-nums">
-            <span className="text-accent-success">{passSignals}</span>
-            <span className="text-text-muted text-sm"> / {report.technicalSignals.length}</span>
+            <span className="text-pass-deep">{passSignals}</span>
+            <span className="text-sm text-ink-mute"> / {report.technicalSignals.length}</span>
           </div>
-          <div className="text-[10px] text-text-muted mt-0.5">{warnSignals} warn, {failSignals} fail</div>
+          <div className="mt-0.5 font-mono text-[10px] text-ink-mute">{warnSignals} warn, {failSignals} fail</div>
         </div>
-        <div className="p-4 rounded-lg border border-border bg-bg-surface">
-          <div className="text-[10px] font-mono uppercase tracking-wider text-text-muted">Citability</div>
-          <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-text-secondary">{report.citabilityScore}</div>
-          <div className="text-[10px] text-text-muted mt-0.5">/ 100</div>
+        <div className="bg-raised p-4">
+          <div className="font-text text-[12px] font-semibold text-ink-mute">Citability</div>
+          <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-ink-soft">{report.citabilityScore ?? '—'}</div>
+          <div className="mt-0.5 font-mono text-[10px] text-ink-mute">/ 100</div>
         </div>
       </div>
 
       <ReportNextStep
         report={report}
         claimToken={state.claim_token}
-        criticalCount={criticalCount}
-        highCount={highCount}
+        repeatCount={state.repeat_count}
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-3 space-y-4">
-          <div className="p-5 rounded-xl border border-border bg-bg-surface flex flex-col items-center">
+          <div className="flex flex-col items-center rounded-[10px] border border-rail bg-raised p-5">
             <ScoreGauge score={report.geoScore} label="GEO Score" />
-            <div className="mt-4 w-full pt-4 border-t border-border">
+            <div className="mt-4 w-full border-t border-rail pt-4">
               <div className="flex items-center justify-between text-xs">
-                <span className="text-text-muted">Citability Score</span>
-                <span className="font-mono font-semibold text-text-secondary">
-                  {report.citabilityScore}/100
+                <span className="text-ink-mute">Citability Score</span>
+                <span className="font-mono font-semibold tabular-nums text-ink-soft">
+                  {report.citabilityScore === null ? '—' : `${report.citabilityScore}/100`}
                 </span>
               </div>
             </div>
           </div>
 
-          <div className="p-4 rounded-xl border border-border bg-bg-surface">
-            <h3 className="text-[10px] font-mono font-semibold uppercase tracking-wider text-text-muted mb-3">Export Report</h3>
+          <div className="rounded-[10px] border border-rail bg-raised p-4">
+            <h3 className="mb-3 font-text text-[12.5px] font-semibold text-ink-mute">Export Report</h3>
             <ExportActions reportUrl={report.url} />
+            <p className="mt-3 text-xs text-ink-soft leading-relaxed">
+              Auditing a prospect&apos;s site? The PDF works as a leave-behind for your pitch.
+            </p>
           </div>
 
           <ScoreHistory url={report.url} currentScore={report.geoScore} />
@@ -469,8 +540,8 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
         <div className="lg:col-span-9 space-y-8">
           <section>
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs font-mono font-semibold uppercase tracking-wider text-text-muted">Category Breakdown</h2>
-              <span className="text-[11px] text-text-muted">
+              <h2 className="font-text text-[12.5px] font-semibold text-ink-mute">Category Breakdown</h2>
+              <span className="font-mono text-[11px] tabular-nums text-ink-mute">
                 {activeCategories} of {report.categories.length} active
               </span>
             </div>
@@ -488,8 +559,8 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
 
           <section>
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs font-mono font-semibold uppercase tracking-wider text-text-muted">Technical Signals</h2>
-              <span className="text-[11px] text-text-muted">
+              <h2 className="font-text text-[12.5px] font-semibold text-ink-mute">Technical Signals</h2>
+              <span className="font-mono text-[11px] tabular-nums text-ink-mute">
                 {passSignals} pass · {warnSignals} warn · {failSignals} fail
               </span>
             </div>
@@ -498,15 +569,15 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
 
           <section>
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs font-mono font-semibold uppercase tracking-wider text-text-muted">Recommendations</h2>
-              <div className="flex items-center gap-2">
+              <h2 className="font-text text-[12.5px] font-semibold text-ink-mute">Recommendations</h2>
+              <div className="flex items-center gap-2 font-mono text-[11px] tabular-nums">
                 {criticalCount > 0 && (
-                  <span className="text-[11px] font-mono text-accent-danger">{criticalCount} critical</span>
+                  <span className="text-fail">{criticalCount} critical</span>
                 )}
                 {highCount > 0 && (
-                  <span className="text-[11px] font-mono text-accent-warning">{highCount} high</span>
+                  <span className="text-warn">{highCount} high</span>
                 )}
-                <span className="text-[11px] text-text-muted">· {report.recommendations.length} total</span>
+                <span className="text-ink-mute">· {report.recommendations.length} total</span>
               </div>
             </div>
             <RecommendationList recommendations={report.recommendations} />
@@ -515,24 +586,24 @@ export default function AuditReportContainer({ reportId }: AuditReportContainerP
       </div>
 
       {state.claim_token && (
-        <div className="mt-6 rounded-xl border border-accent-teal/30 bg-accent-teal/5 p-5 flex flex-col sm:flex-row items-start sm:items-center gap-4">
+        <div className="mt-6 flex flex-col items-start gap-4 rounded-[10px] border border-pass/50 bg-pass-wash/60 p-5 sm:flex-row sm:items-center">
           <div className="flex-1">
-            <p className="text-sm font-semibold text-text-primary mb-0.5">Save this report to your dashboard</p>
-            <p className="text-xs text-text-secondary">Create a free account to track this domain over time. Report link expires in 24h.</p>
+            <p className="mb-0.5 text-sm font-semibold text-ink">Save this report to your dashboard</p>
+            <p className="text-xs text-ink-soft">Create a free account to save this report and see how AI engines answer about this site. Report link expires in 24h.</p>
           </div>
           <div className="flex flex-col sm:flex-row gap-2 shrink-0">
             <a
               href={`https://app.geoready.dev/signup?claim=${state.claim_token}`}
               onClick={() => trackCtaClicked({ cta_location: 'audit_report_claim', cta_text: 'Save report' })}
-              className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-accent-teal text-white text-sm font-semibold hover:bg-accent-teal-dark transition-colors"
+              className="inline-flex items-center justify-center gap-2 rounded-[10px] bg-pass-deep px-4 py-2 font-text text-[13px] font-semibold text-on-accent transition-colors hover:bg-pass"
             >
               Save report
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
             </a>
             <a
               href={`https://app.geoready.dev/login?claim=${state.claim_token}`}
               onClick={() => trackCtaClicked({ cta_location: 'audit_report_claim', cta_text: 'Log in to save' })}
-              className="inline-flex items-center justify-center px-4 py-2 rounded-lg border border-border text-text-primary text-sm font-semibold hover:bg-bg-subtle transition-colors"
+              className="inline-flex items-center justify-center rounded-[10px] border border-rail bg-raised px-4 py-2 font-text text-[13px] font-semibold text-ink transition-colors hover:bg-pass-wash"
             >
               Log in to save
             </a>

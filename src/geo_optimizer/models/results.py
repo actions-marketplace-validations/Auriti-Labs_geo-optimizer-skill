@@ -44,6 +44,7 @@ class RobotsResult:
     crawl_delay: float | None = None
     # True if citation bots are explicitly allowed (not just via wildcard — #111)
     citation_bots_explicit: bool = False
+    sitemaps: list[str] = field(default_factory=list)
 
 
 # ─── llms.txt ────────────────────────────────────────────────────────────────
@@ -66,6 +67,9 @@ class LlmsTxtResult:
     has_optional_section: bool = False  # ## Optional section present
     companion_files_hint: bool = False  # link to companion .md files
     validation_warnings: list[str] = field(default_factory=list)  # conformance warnings
+    # CDN/WAF blocking: /llms.txt may exist but the auditor's User-Agent was
+    # rejected (403/406). A second fetch with a browser-like UA may prove it.
+    blocked_by_cdn: bool = False
 
 
 @dataclass
@@ -120,6 +124,7 @@ class SchemaResult:
     # Schema completeness: types found but missing required fields (gap #3)
     schema_missing_fields: dict = field(default_factory=dict)
     incomplete_schema_types: list = field(default_factory=list)
+    visible_match: bool = False
 
 
 # ─── Meta tags ───────────────────────────────────────────────────────────────
@@ -162,6 +167,7 @@ class ContentResult:
     has_heading_hierarchy: bool = False  # H2+H3 present in correct hierarchy
     has_lists_or_tables: bool = False  # <ul>/<ol>/<table> found
     has_front_loading: bool = False  # key info in the first 30%
+    images_alt_ok: bool = False
 
 
 # ─── Signals tecnici (v4.0) ──────────────────────────────────────────────────
@@ -177,6 +183,7 @@ class SignalsResult:
     rss_url: str = ""
     has_freshness: bool = False
     freshness_date: str = ""
+    freshness_valid: bool = False
 
 
 # ─── Brand & Entity (v4.3) ────────────────────────────────────────────────────
@@ -226,7 +233,8 @@ class MethodScore:
     detected: bool = False
     score: int = 0
     max_score: int = 10
-    impact: str = ""  # "+27%"
+    # Historical label such as "+27%": unverified, not measured on current engines, not used in scoring.
+    impact: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -260,6 +268,7 @@ class AiDiscoveryResult:
     endpoints_found: int = 0  # total count of endpoints found (0-4)
     has_webmcp_declaration: bool = False  # /ai/summary.json declares a "webmcp" block (#535)
     webmcp_declared_tool_count: int = 0  # tool names listed in that declaration, if any
+    has_markdown: bool = False
 
 
 # ─── CDN AI Crawler Check (#225) ─────────────────────────────────────────────
@@ -355,6 +364,12 @@ class WebMcpResult:
     potential_actions: list[str] = field(default_factory=list)  # action types found
     has_labeled_forms: bool = False  # forms with accessible label + description
     labeled_forms_count: int = 0
+    has_embedded_form_provider: bool = False  # form via known third-party embed
+    # (Tally, Typeform, etc.) — same invisible-to-static-crawl limitation as
+    # has_webmcp_declaration above: the fields live inside a cross-origin
+    # <iframe> a static fetch can't see into. Credited toward
+    # has_labeled_forms since these providers build accessible markup into
+    # their hosted forms by default.
     has_openapi: bool = False  # link to OpenAPI/Swagger spec
 
     # Summary
@@ -407,6 +422,14 @@ class PromptInjectionResult:
     aria_hidden_injection_found: bool = False
     aria_hidden_injection_count: int = 0
     aria_hidden_samples: list[str] = field(default_factory=list)
+
+    # UGC injection surface: comment/review/forum regions where a third party
+    # (not the site owner) can place content an AI crawler will read. Not an
+    # injection by itself — an attack surface to moderate. (Deep-Research Agents
+    # Can Be Poisoned via User-Generated Content, arXiv:2605.24245)
+    ugc_surface_found: bool = False
+    ugc_surface_samples: list[str] = field(default_factory=list)
+    ugc_injection_risk: bool = False  # an injection pattern was found AND a UGC region is present
 
     # Summary
     patterns_found: int = 0  # active categories (0-8)
@@ -793,14 +816,17 @@ class TopicAuthorityResult:
 
 @dataclass
 class CitationCheckEntry:
-    """A single query result in the one-shot AI citation check."""
+    """A single query result in the AI citation check (aggregated across runs)."""
 
     query: str = ""
     platform: str = ""
     model: str = ""
-    brand_mentioned: bool = False
-    domain_cited: bool = False
-    cited_sources: list[str] = field(default_factory=list)  # source URLs from the answer
+    runs: int = 1  # successful answers collected for this query
+    mention_runs: int = 0  # of `runs`, how many answers mentioned the brand
+    citation_runs: int = 0  # of `runs`, how many answers cited the domain
+    brand_mentioned: bool = False  # brand mentioned in at least one run
+    domain_cited: bool = False  # domain cited in at least one run
+    cited_sources: list[str] = field(default_factory=list)  # union of source URLs across runs
     snippet: str = ""
     error: str | None = None
 
@@ -814,9 +840,14 @@ class CitationCheckResult:
     brand: str = ""
     domain: str = ""
     entries: list[CitationCheckEntry] = field(default_factory=list)
-    queries_run: int = 0
+    queries_run: int = 0  # distinct queries that returned at least one answer
+    runs_per_query: int = 1  # how many times each query was asked
+    total_answers: int = 0  # queries_run x runs_per_query, minus failed calls
     brand_mention_rate: float = 0.0  # 0-1, share of answers mentioning the brand
     domain_citation_rate: float = 0.0  # 0-1, share of answers citing the domain as a source
+    brand_mention_rate_ci: tuple[float, float] = (0.0, 0.0)  # 95% Wilson interval
+    domain_citation_rate_ci: tuple[float, float] = (0.0, 0.0)  # 95% Wilson interval
+    stable: bool = False  # True when the CI does not straddle a verdict boundary (needs runs > 1)
     top_cited_domains: list[tuple[str, int]] = field(default_factory=list)  # (domain, count), own domain excluded
     verdict: str = ""  # strong | cited | mentioned_only | invisible
 
@@ -958,6 +989,33 @@ class HallucinationBaitResult:
     details: list[str] = field(default_factory=list)
 
 
+# ─── Google AI readiness ─────────────────────────────────────────────────────
+
+
+@dataclass
+class ReadinessCheck:
+    """Esito di un check Google AI con fonte e livello di evidenza."""
+
+    id: str
+    status: str
+    points: int
+    max_points: int
+    evidence: str
+    source_url: str
+    evidence_level: str = "google-official"
+
+
+@dataclass
+class GoogleAiReadinessResult:
+    """Conformità ai requisiti Google per AI Overviews / AI Mode (rubric v2)."""
+
+    checked: bool = False
+    points: int = 0
+    max_points: int = 0
+    final_url: str = ""
+    checks: list[ReadinessCheck] = field(default_factory=list)
+
+
 # ─── Full audit ──────────────────────────────────────────────────────────────
 
 
@@ -1023,6 +1081,18 @@ class AuditResult:
     intent_mapping: IntentMappingResult = field(default_factory=IntentMappingResult)
     # v4.10: Hallucination Bait Detection (#377)
     hallucination_bait: HallucinationBaitResult = field(default_factory=HallucinationBaitResult)
+    # v4.19: Google AI readiness + rubric versionata
+    google_ai: GoogleAiReadinessResult = field(default_factory=GoogleAiReadinessResult)
+    score_version: int = 1
+    score_max: dict[str, int] = field(default_factory=dict)
+    # Same strings as ``recommendations``, grouped by the category that produced them.
+    # Keys are the ``score_breakdown`` categories of the active rubric plus the non-scored
+    # "blockers" (RECOMMENDATION_BLOCKERS_CATEGORY) and "other" (RECOMMENDATION_OTHER_CATEGORY);
+    # only non-empty groups are present. Each string of
+    # ``recommendations`` appears in exactly one group, in the same relative order.
+    # Empty dict = category unknown (results built by older code or restored from a
+    # cache written before this field existed).
+    recommendations_by_category: dict[str, list[str]] = field(default_factory=dict)
 
 
 # ─── Batch audit ─────────────────────────────────────────────────────────────
@@ -1039,6 +1109,8 @@ class BatchAuditPageResult:
     error: str | None = None
     score_breakdown: dict[str, int] = field(default_factory=dict)
     recommendations_count: int = 0
+    score_version: int = 1
+    score_max: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1100,6 +1172,7 @@ class AuditDiffResult:
     improved_categories: list[CategoryDelta] = field(default_factory=list)
     regressed_categories: list[CategoryDelta] = field(default_factory=list)
     unchanged_categories: list[CategoryDelta] = field(default_factory=list)
+    version_mismatch: bool = False
 
 
 # ─── Gap analysis ────────────────────────────────────────────────────────────
@@ -1275,6 +1348,7 @@ class HistoryEntry:
     recommendations_count: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)
     delta: int | None = None
+    score_version: int = 1
 
 
 @dataclass

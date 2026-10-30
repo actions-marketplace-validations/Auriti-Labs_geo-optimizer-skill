@@ -12,7 +12,7 @@ Install with the `mcp` extra:
 pip install geo-optimizer-skill[mcp]
 ```
 
-This installs the `geo-mcp` entry point alongside the `mcp` Python SDK.
+This installs the `geo-mcp` entry point alongside the `mcp` Python SDK (1.x).
 
 ---
 
@@ -76,14 +76,32 @@ Run a complete GEO audit on a website. Analyzes 7 areas: robots.txt, llms.txt, J
   "url": "https://example.com",
   "score": 72,
   "band": "good",
-  "score_breakdown": {
-    "robots": 18,
+  "score_version": 2,
+  "score_max": {
+    "google_ai": 20,
+    "robots": 14,
+    "schema": 14,
+    "content": 14,
+    "brand_entity": 12,
+    "meta": 11,
     "llms": 6,
-    "schema": 16,
-    "meta": 14,
+    "signals": 6,
+    "ai_discovery": 3
+  },
+  "score_breakdown": {
+    "google_ai": 0,
+    "robots": 14,
+    "llms": 6,
+    "schema": 14,
+    "meta": 11,
     "content": 10,
     "signals": 5,
     "ai_discovery": 3
+  },
+  "google_ai": {
+    "points": 0,
+    "max_points": 20,
+    "checks": []
   },
   "recommendations": [
     "Add llms-full.txt for comprehensive AI indexing",
@@ -367,7 +385,7 @@ MCP resources provide read-only reference data. Access them via the `geo://` URI
 |-----|-------------|
 | `geo://ai-bots` | List of all 24 tracked AI bots with 3-tier classification (training/search/user) and citation bot identification |
 | `geo://score-bands` | GEO score band definitions (critical, foundation, good, excellent) with ranges |
-| `geo://methods` | The 11 citability methods with measured impact data and max scores |
+| `geo://methods` | The 47 citability methods with max scores and a legacy `impact` label (historical, not measured on current engines) |
 | `geo://changelog` | Latest changes from CHANGELOG.md (first 50 lines) |
 | `geo://ai-discovery-spec` | AI discovery endpoint specification (geo-checklist.dev standard) with required fields and JSON schemas |
 
